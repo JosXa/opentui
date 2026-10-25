@@ -1028,17 +1028,22 @@ test "input parser times out partial units unless they may be mouse reports, Kit
         // Only the shapes the host waits for defer: `CSI 8 ; h ; w t` is not a pixel reply.
         .{ replies, "\x1b[8;600;80", 1, "t", &.{ frag("\x1b[8;600;80"), ch('t') } },
         .{ replies, "\x1b[1;2:3:4:5", 1, "R", &.{ frag("\x1b[1;2:3:4:5"), ch('R') } },
-        // An awaited string reply waits out a pause at any cut; a lone Escape still times out.
-        .{ replies, "\x1b]", 0, "11;rgb:0/0/0\x07", &.{reply("\x1b]11;rgb:0/0/0\x07")} },
+        // A string shaped like an awaited reply waits out a pause once its first payload byte fits;
+        // a lone Escape, a bare introducer, and other strings still time out.
+        .{ replies, "\x1b]1", 0, "1;rgb:0/0/0\x07", &.{reply("\x1b]11;rgb:0/0/0\x07")} },
         .{ replies, "\x1b]11;rg", 0, "b:0/0/0\x07", &.{reply("\x1b]11;rgb:0/0/0\x07")} },
         .{ replies, "\x1b]11;rgb:0/0/0\x1b", 0, "\\", &.{reply("\x1b]11;rgb:0/0/0\x1b\\")} },
-        .{ replies, "\x1bP", 0, ">|kitty(0.40.1)\x1b\\", &.{reply("\x1bP>|kitty(0.40.1)\x1b\\")} },
+        .{ replies, "\x1bP>", 0, "|kitty(0.40.1)\x1b\\", &.{reply("\x1bP>|kitty(0.40.1)\x1b\\")} },
         .{ replies, "\x1bP>|kitty(0.4", 0, "0.1)\x1b\\", &.{reply("\x1bP>|kitty(0.40.1)\x1b\\")} },
         .{ replies, "\x1bP1$r0m\x1b", 0, "\\", &.{reply("\x1bP1$r0m\x1b\\")} },
-        .{ replies, "\x1b_", 0, "Gi=1;OK\x1b\\", &.{reply("\x1b_Gi=1;OK\x1b\\")} },
+        .{ replies, "\x1b_G", 0, "i=1;OK\x1b\\", &.{reply("\x1b_Gi=1;OK\x1b\\")} },
         .{ replies, "\x1b_Gi=1;", 0, "OK\x1b\\", &.{reply("\x1b_Gi=1;OK\x1b\\")} },
         .{ replies, "\x1b_Gi=1;OK\x1b", 0, "\\", &.{reply("\x1b_Gi=1;OK\x1b\\")} },
         .{ replies, "\x1b", 1, "a", &.{ k(K.escape, NONE), ch('a') } },
+        .{ replies, "\x1b]", 1, "1", &.{ frag("\x1b]"), ch('1') } },
+        .{ replies, "\x1b]x", 1, "1", &.{ frag("\x1b]x"), ch('1') } },
+        .{ replies, "\x1bP+", 1, "q", &.{ frag("\x1bP+"), ch('q') } },
+        .{ replies, "\x1b_g", 1, "q", &.{ frag("\x1b_g"), ch('q') } },
         .{ plain, "\x1b", 1, "a", &.{ k(K.escape, NONE), ch('a') } },
         .{ plain, "\x1b]11;rg", 1, "b\x07", &.{ frag("\x1b]11;rg"), ch('b'), k('g', CTRL) } },
         .{ plain, "\x1bP>|k\x1b", 1, "\\", &.{ frag("\x1bP>|k\x1b"), ch('\\') } },
@@ -1067,8 +1072,8 @@ test "input parser times out partial units unless they may be mouse reports, Kit
     _ = try harness.feed("\x1b[4;1");
     harness.parser.setExpectations(.{});
     try expectGot("", &.{frag("\x1b[4;1")}, try harness.wait(20));
-    // A held string ends as a fragment when the host stops waiting or after the reply timeout;
-    // an overlong one is discarded through its terminator, pauses included.
+    // A held string ends as a fragment when the host stops waiting, or 5 s after its introducer
+    // however its bytes arrive; an overlong one is discarded until then or its terminator.
     harness.parser.setExpectations(.{ .replies = true });
     _ = try harness.feed("\x1b]11;rg");
     try expectGot("", &.{}, try harness.wait(1000));
@@ -1076,15 +1081,35 @@ test "input parser times out partial units unless they may be mouse reports, Kit
     try expectGot("", &.{frag("\x1b]11;rg")}, try harness.wait(0));
     harness.parser.setExpectations(.{ .replies = true });
     _ = try harness.feed("\x1bP>|");
-    harness.now += ip.reply_timeout_ns - ms;
-    try expectGot("", &.{}, try harness.wait(0));
-    try expectGot("", &.{frag("\x1bP>|")}, try harness.wait(1));
-    _ = try harness.feed("\x1b_" ++ [_]u8{'9'} ** ip.unit_bytes_max);
+    try expectGot("", &.{}, try harness.wait(3000));
+    _ = try harness.feed("k");
+    try expectGot("", &.{}, try harness.wait(1999));
+    try expectGot("", &.{frag("\x1bP>|k")}, try harness.wait(2));
+    _ = try harness.feed("\x1b_G" ++ [_]u8{'9'} ** ip.unit_bytes_max);
     try expectGot("", &.{}, try harness.wait(1000));
+    try expectGot("", &.{}, try harness.feed("9"));
+    try expectGot("", &.{}, try harness.wait(3999));
+    try expectGot("", &.{}, try harness.wait(2));
+    try expectGot("", &.{ch('q')}, try harness.feed("q"));
+    _ = try harness.feed("\x1b_G" ++ [_]u8{'9'} ** ip.unit_bytes_max);
     try expectGot("", &.{ch('q')}, try harness.feed("9\x1b\\q"));
     _ = try harness.feed("\x1b[" ++ [_]u8{'9'} ** ip.sequence_bytes_max);
     try expectGot("", &.{}, try harness.wait(20));
     try expectGot("", &.{ ch('1'), ch('q') }, try harness.feed("1q"));
+    // A typed Alt+], Alt+Shift+P, or Alt+_ is no reply shape: however long the host has waited for
+    // replies, the keys typed after it arrive as without expectations.
+    for ("]P_") |introducer| {
+        const alt = [_]u8{ 0x1b, introducer };
+        _ = try harness.wait(60_000);
+        _ = try harness.feed(&alt);
+        try expectGot(&alt, &.{frag(&alt)}, try harness.wait(120));
+        for ([_]struct { u8, Expect }{
+            .{ 'h', ch('h') }, .{ '\r', k(K.enter, NONE) }, .{ 0x03, k('c', CTRL) }, .{ 0x7f, k(K.backspace, NONE) },
+        }) |typed| {
+            _ = try harness.wait(120);
+            try expectGot(&alt, &.{typed[1]}, try harness.feed(&.{typed[0]}));
+        }
+    }
 }
 
 test "input parser recovers mouse reports after a timed-out Escape" {

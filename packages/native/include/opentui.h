@@ -2958,7 +2958,9 @@ ot_status ot_session_input_feed(
 /* flags is a combination of OT_INPUT_EXPECT_* bits; other bits must be zero.
  * Set REPLIES while any query is outstanding, including the capability queries
  * that setup publishes. It keeps a partial CSI reply waiting past the timeout,
- * and a partial OSC, DCS, or APC string up to 5 s per byte. CURSOR_POSITION, which implies REPLIES, marks a cursor position request: it
+ * and an OSC, DCS, or APC string that begins like a reply (OSC and a digit,
+ * DCS and > or a digit, APC and G) until 5 s after its introducer.
+ * CURSOR_POSITION, which implies REPLIES, marks a cursor position request: it
  * makes a complete CSI 1 ; N R (N >= 2) a CURSOR_POSITION reply instead of a
  * modified F3 key. KITTY_KEYBOARD keeps a partial Kitty key waiting and makes
  * CSI R and CSI 1 ; N R replies, since the Kitty protocol sends F3 as CSI 13 ~;

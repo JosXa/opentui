@@ -5,7 +5,7 @@
 const std = @import("std");
 
 pub const timeout_ns: u64 = 20 * std.time.ns_per_ms;
-/// How long an awaited OSC, DCS, or APC reply, split by a slow link, or its discarded overflow waits for a byte.
+/// How long after its introducer an awaited OSC, DCS, or APC reply, split by a slow link, may end.
 pub const reply_timeout_ns: u64 = 5 * std.time.ns_per_s;
 pub const unit_bytes_max: u16 = 4096;
 pub const sequence_bytes_max: u16 = 256;
@@ -218,6 +218,8 @@ pub const InputParser = struct {
     unit_len: u16 = 0,
     /// Arrival time of the last byte of the pending unit.
     since_ns: u64 = 0,
+    /// Arrival time of the pending unit's introducer.
+    begun_ns: u64 = 0,
     x10_button: u8 = 0,
     discarded_count: u32 = 0,
 
@@ -234,10 +236,12 @@ pub const InputParser = struct {
             if (!sink.hasRoomForOneByte()) break;
             const run = self.pasteRun(bytes[consumed..], sink);
             if (run > 0) {
+                self.since_ns = now_ns;
                 sink.appendPaste(bytes[consumed..][0..run]);
                 consumed += run;
                 continue;
             }
+            self.since_ns = now_ns;
             const count_before = sink.count;
             const payload_before = sink.payload_len;
             self.step(bytes[consumed], sink);
@@ -245,7 +249,6 @@ pub const InputParser = struct {
             std.debug.assert(sink.payload_len - payload_before <= payload_per_byte_max);
             consumed += 1;
         }
-        if (consumed > 0) self.since_ns = now_ns;
         self.assertValid();
         return @intCast(consumed);
     }
@@ -255,8 +258,7 @@ pub const InputParser = struct {
         const timeout: u64 = switch (self.state) {
             .ground, .expired, .paste => return null,
             .csi => |csi| if (csi.deferred and self.deferrable()) return null else timeout_ns,
-            .string => if (self.expect.replies) reply_timeout_ns else timeout_ns,
-            .discard => |discard| if (discard.string and self.expect.replies) reply_timeout_ns else timeout_ns,
+            .string, .discard => if (self.awaitedString()) return self.begun_ns +| reply_timeout_ns else timeout_ns,
             else => timeout_ns,
         };
         return self.since_ns +| timeout;
@@ -638,6 +640,7 @@ pub const InputParser = struct {
         self.unit[1] = introducer;
         self.unit_len = 2;
         self.state = state;
+        self.begun_ns = self.since_ns;
     }
 
     fn escape(self: *InputParser) void {
@@ -751,6 +754,19 @@ pub const InputParser = struct {
         if (params[0] == '<') return allOf(params[1..], "0123456789;");
         return (self.expect.replies and self.replyShaped()) or
             (self.expect.kitty_keyboard and params[0] != '?' and Shape.of(params, true) != null);
+    }
+
+    /// Whether a string, or its discarded overflow, begins like a reply to a query the host sends:
+    /// OSC 4, 10 to 19, 99, 1337, and 7501 with a digit, DCS XTVERSION with `>` and XTGETTCAP with
+    /// a digit, and APC Kitty graphics with `G`. Typed Alt+], Alt+Shift+P, and Alt+_ do not wait.
+    fn awaitedString(self: *const InputParser) bool {
+        if (!self.expect.replies or self.unit_len < 3) return false;
+        return switch (self.unit[1]) {
+            ']' => isDigit(self.unit[2]),
+            'P' => self.unit[2] == '>' or isDigit(self.unit[2]),
+            '_' => self.unit[2] == 'G',
+            else => false,
+        };
     }
 
     /// Whether the CSI parameters may begin a cursor position, pixel size, or private reply.
