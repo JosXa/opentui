@@ -13,6 +13,8 @@ import {
 } from "@opentui/keymap/solid"
 import { render, type JSX } from "@opentui/solid"
 import { Show, createSignal, onCleanup } from "solid-js"
+import { createStore } from "solid-js/store"
+import { formatCommandBindings } from "@opentui/keymap/extras"
 import { createDiagnosticHarness } from "../../tests/diagnostic-harness.js"
 
 const diagnostics = createDiagnosticHarness()
@@ -189,6 +191,46 @@ describe("solid keymap hooks", () => {
     runs.push(selectorRuns)
 
     expect(runs.map((count) => count - runs[0]!)).toEqual([0, 0, 1])
+  })
+
+  test("useBindings layers built from a Solid store follow store changes", async () => {
+    const calls: string[] = []
+    const [store, setStore] = createStore({
+      spread: { name: "spread", title: "one", run: () => void calls.push("spread one") },
+      proxy: { name: "proxy", title: "one", run: () => void calls.push("proxy one") },
+      keys: { spread: "x", proxy: "y" },
+    })
+    let labels!: () => string
+
+    function App() {
+      // A plain copy of store data, and the store proxy itself, which is not plain data.
+      useBindings(() => ({ commands: [{ ...store.spread }], bindings: [{ key: store.keys.spread, cmd: "spread" }] }))
+      useBindings(() => ({ commands: [store.proxy], bindings: [{ key: store.keys.proxy, cmd: "proxy" }] }))
+      labels = useKeymapSelector((keymap) =>
+        keymap
+          .getCommandEntries()
+          .map(({ command, bindings }) => `${command.name}:${command.title}:${formatCommandBindings(bindings)}`)
+          .sort()
+          .join(" "),
+      )
+      return <text>{labels()}</text>
+    }
+
+    testSetup = await testRender(() => <App />, { width: 40, height: 6 })
+    const seen = [labels()]
+    setStore("spread", "title", "two")
+    setStore("proxy", "title", "two")
+    setStore("keys", "spread", "z")
+    await Bun.sleep(0)
+    seen.push(labels())
+    setStore("spread", "run", () => () => void calls.push("spread two"))
+    setStore("proxy", "run", () => () => void calls.push("proxy two"))
+    await Bun.sleep(0)
+    testSetup.mockInput.pressKey("z")
+    testSetup.mockInput.pressKey("y")
+
+    expect(seen).toEqual(["proxy:one:y spread:one:x", "proxy:two:y spread:two:z"])
+    expect(calls).toEqual(["spread two", "proxy two"])
   })
 
   test("useBindings supports declarative release bindings", async () => {

@@ -11,9 +11,10 @@ const PLAIN_FUNCTION_KEYS = new Set<PropertyKey>(["length", "name", "prototype"]
 // Copies plain data for a later `samePlainData`, with every function as one marker. Plain data is plain
 // objects, arrays and primitives with enumerable string-keyed data properties, and functions with no own
 // properties of their own. Anything else (other prototypes, frozen, sealed or non-extensible objects,
-// accessors, symbol or non-enumerable keys, data deeper than 16) returns `NOT_PLAIN_DATA`. A proxy cannot be
-// told apart portably; one that behaves as plain data is read as plain data, and nothing is written to it.
-export function snapshotPlainData(value: unknown, depth = 0): unknown {
+// accessors, symbol, non-enumerable or `__proto__` keys, cycles or data deeper than 16) returns
+// `NOT_PLAIN_DATA`. Values are read through the object, so a proxy's copy holds what its readers see. The
+// top-level `identityKey` value is kept as it is (a layer's target).
+export function snapshotPlainData(value: unknown, identityKey?: string, depth = 0): unknown {
   if (typeof value === "function") {
     return Reflect.ownKeys(value).every((key) => PLAIN_FUNCTION_KEYS.has(key)) ? FUNCTION_DATA : NOT_PLAIN_DATA
   }
@@ -26,9 +27,10 @@ export function snapshotPlainData(value: unknown, depth = 0): unknown {
   const copy = (isArray ? [] : {}) as Record<string, unknown>
   for (const key of Reflect.ownKeys(value)) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key)!
-    if (typeof key !== "string" || !("value" in descriptor)) return NOT_PLAIN_DATA
+    if (typeof key !== "string" || key === "__proto__" || !("value" in descriptor)) return NOT_PLAIN_DATA
     if (!descriptor.enumerable && !(isArray && key === "length")) return NOT_PLAIN_DATA
-    const entry = snapshotPlainData(descriptor.value, depth + 1)
+    const read = Reflect.get(value, key)
+    const entry = depth === 0 && key === identityKey ? read : snapshotPlainData(read, undefined, depth + 1)
     if (entry === NOT_PLAIN_DATA) return NOT_PLAIN_DATA
     copy[key] = entry
   }

@@ -170,17 +170,16 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
     })
   }
 
-  // What a re-registration compares: the target and the compile registries by identity, and a copy of the
-  // rest of the layer. Undefined when that is not plain data, or when reading it throws.
+  // What a re-registration compares: a plain-data copy of the whole layer (its target by identity) and the
+  // compile registries by identity. Undefined when the layer is not plain data, or when reading it throws.
   const snapshotLayer = (layer: Layer<TTarget, TEvent>): unknown[] | undefined => {
     try {
-      const { target, ...data } = layer
-      const copy = snapshotPlainData(data)
+      const copy = snapshotPlainData(layer, "target")
       if (copy === NOT_PLAIN_DATA) return undefined
       const { layerBindingsTransformers, bindingExpanders, bindingParsers, bindingTransformers } = state
       const registries = [layerBindingsTransformers, bindingExpanders, bindingParsers, bindingTransformers]
       const fields = [...state.layerFields.values(), ...state.bindingFields.values(), ...state.commandFields.values()]
-      return [target, copy, fields, state.commandTransformers.values(), ...registries.map((item) => item.values())]
+      return [copy, fields, state.commandTransformers.values(), ...registries.map((item) => item.values())]
     } catch {
       return undefined
     }

@@ -812,6 +812,15 @@ describe("keymap: commands and queries", () => {
         },
       })
     const nested = (depth: number): object => (depth === 0 ? {} : { inner: nested(depth - 1) })
+    const cyclic = () => {
+      const meta: Record<string, unknown> = {}
+      meta.self = meta
+      return meta
+    }
+    let reads = 0
+    // Reports static descriptors, but every read of `title` once armed returns a new value.
+    const counting = (target: object) =>
+      new Proxy(target, { get: (target, key) => (key === "title" && armed ? `t${reads++}` : Reflect.get(target, key)) })
     const symbol = Symbol("field")
     const meta = { label: "a" }
     const map = new Map()
@@ -901,6 +910,19 @@ describe("keymap: commands and queries", () => {
       ],
       ["function with properties", { name: "c", run: tagged("old") }, { name: "c", run: tagged("new") }, "replaced"],
       ["deeper than 16", command("old", { meta: nested(16) }), command("new", { meta: nested(16) }), "replaced"],
+      ["cycle", command("old", { meta: cyclic() }), command("new", { meta: cyclic() }), "replaced"],
+      [
+        "own __proto__ key",
+        command("old", JSON.parse('{"__proto__":1}')),
+        command("new", JSON.parse('{"__proto__":1}')),
+        "replaced",
+      ],
+      [
+        "proxy whose reads change",
+        counting(command("old", { title: "t" })),
+        counting(command("new", { title: "t" })),
+        "replaced",
+      ],
       [
         "reading it throws",
         command("old", { meta: throwing({}, () => true) }),
@@ -925,7 +947,7 @@ describe("keymap: commands and queries", () => {
       armed = false
       flag = true
       const copies = [{ ...first }, { ...next }]
-      const registered = layers.replaceLayer(undefined, { commands: [first as Command] })
+      const registered = layers.replaceLayer(undefined, { commands: [first as never] })
       const retained = keymap.getCommands({ visibility: "registered" })[0]!
       let events = 0
       keymap.on("state", () => void (events += 1))
@@ -939,7 +961,7 @@ describe("keymap: commands and queries", () => {
       }
 
       events = 0
-      layers.replaceLayer(registered, { commands: [next as Command] })
+      layers.replaceLayer(registered, { commands: [next as never] })
       calls.length = 0
       keymap.runCommand("c")
       retained.run({} as never)
@@ -976,21 +998,75 @@ describe("keymap: commands and queries", () => {
     ])
   })
 
-  test("a replace with another target or after a compile registry changed is a full replace", () => {
+  test("the plain-data check covers the layer object itself", () => {
+    const commands = (...names: string[]) => names.map((name) => ({ name, run() {} }))
+    const hidden = (key: string, value: unknown, layer: object = { commands: commands("c") }) =>
+      Object.defineProperty(layer, key, { value })
+    const rows: [string, () => object, () => object, string[]][] = [
+      [
+        "getter",
+        () => ({
+          get priority() {
+            return 0
+          },
+          commands: commands("c"),
+        }),
+        () => ({
+          get priority() {
+            return 0
+          },
+          commands: commands("c"),
+        }),
+        ["c"],
+      ],
+      [
+        "frozen layer",
+        () => Object.freeze({ commands: commands("c") }),
+        () => Object.freeze({ commands: commands("c") }),
+        ["c"],
+      ],
+      ["non-enumerable priority", () => hidden("priority", 0), () => hidden("priority", 10), ["c"]],
+      [
+        "non-enumerable commands",
+        () => hidden("commands", commands("c"), {}),
+        () => hidden("commands", commands("c", "d"), {}),
+        ["c", "d"],
+      ],
+    ]
+
+    for (const [change, first, next, names] of rows) {
+      const keymap = getKeymap(renderer)
+      const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
+      const registered = layers.replaceLayer(undefined, first() as never)
+      let events = 0
+      keymap.on("state", () => void (events += 1))
+
+      layers.replaceLayer(registered, next() as never)
+      const registeredNames = keymap.getCommands({ visibility: "registered" }).map((command) => command.name)
+      expect([change, events, registeredNames]).toEqual([change, 1, names])
+    }
+  })
+
+  test("a replace keeps the same target, and fully replaces for another target or a changed compile registry", () => {
     const keymap = getKeymap(renderer)
     const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
-    const layerOf = (target?: Renderable) => ({ target, commands: [{ name: "c", run() {} }] })
+    const first = createFocusableBox("first")
+    const layerOf = (target: Renderable) => ({ target, commands: [{ name: "c", run() {} }] })
+    const counts: number[] = []
     let events = 0
     keymap.on("state", () => void (events += 1))
+    let registered = layers.replaceLayer(undefined, layerOf(first))
+    const replace = (layer: object) => {
+      events = 0
+      registered = layers.replaceLayer(registered, layer as never)
+      counts.push(events)
+    }
 
-    let registered = layers.replaceLayer(undefined, layerOf(createFocusableBox("first")))
-    events = 0
-    registered = layers.replaceLayer(registered, layerOf(createFocusableBox("second")))
-    const afterTarget = events
+    replace(layerOf(first))
+    replace(layerOf(createFocusableBox("second")))
     keymap.appendCommandTransformer(() => {})
-    events = 0
-    layers.replaceLayer(registered, layerOf(registered!.target))
-    expect([afterTarget, events]).toEqual([1, 1])
+    replace(layerOf(registered!.target!))
+    expect(counts).toEqual([0, 1, 1])
   })
 
   test("a failed reactive subscription is retried by the next replace", () => {

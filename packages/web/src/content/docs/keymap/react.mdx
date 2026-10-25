@@ -104,11 +104,12 @@ on top. Earlier versions moved a re-registered layer to the top.
 
 If the layer is plain data, has the same data as the registered one, and differs only in its functions, such as
 fresh `run` or `enabled` closures, the hook keeps the registered layer. Plain data means plain objects, arrays and
-primitives with enumerable string keys, and functions without properties of their own; no class instances,
-`Map`s, getters, symbol keys, or frozen or sealed objects. Command objects read from the keymap earlier then call
-the new functions, and a pending key sequence continues. `state` is emitted only if an `enabled` condition gives a
-different result from the one listeners last saw; other function results, such as a `title` function, are not
-compared. Commands of such a layer are returned as keymap-owned copies, not as the objects passed in. Any other
+primitives with enumerable string keys, and functions without properties of their own, from the layer object down;
+no class instances, `Map`s, getters, symbol or `__proto__` keys, or frozen or sealed objects. A store proxy that
+reports getters is registered anew; spread it to pass plain data. Command objects read from the keymap earlier then
+call the new functions, and a pending key sequence continues. `state` is emitted only if an `enabled` condition
+gives a different result from the one listeners last saw; other function results, such as a `title` function, are
+not compared. Commands of such a layer are returned as keymap-owned copies, not as the objects passed in. Any other
 layer, and any layer with a reactive matcher, is replaced as a new registration in the same position.
 
 The layer can include Core fields such as `priority`, `bindings`, and `commands`.
