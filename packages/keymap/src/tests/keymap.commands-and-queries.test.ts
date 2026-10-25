@@ -724,15 +724,23 @@ describe("keymap: commands and queries", () => {
   })
 
   test("replacing a layer costs state events, entries, and labels only when its content changes", () => {
+    // Object-valued fields keep their identity on a replace, so unchanged layers reuse one `tags` array.
+    const tags: string[] = []
     const layerOf = (layer: number, commands: number, change?: string) => ({
       commands: Array.from({ length: commands + (change === "command added" ? 1 : 0) }, (_, c) => ({
         name: `l${layer}.c${c}`,
-        tags: change === "array to object" ? {} : [],
+        tags: change === "array to object" ? {} : tags,
         run() {},
       })),
       bindings: [
         ...Array.from({ length: commands }, (_, c) => ({
-          key: c === 0 && change === "changed binding" ? "ctrl+shift+a" : `ctrl+${"abcdefghij"[c]}`,
+          // A binding key compiles into a key sequence and compares by content, so a fresh key object is unchanged.
+          key:
+            c === 0 && change === "changed binding"
+              ? "ctrl+shift+a"
+              : c === 1
+                ? { name: "b", ctrl: true }
+                : `ctrl+${"abcdefghij"[c]}`,
           cmd: `l${layer}.c${c}`,
           ...(c === 0 && change === "binding field added" ? { desc: "d" } : {}),
         })),
@@ -824,6 +832,8 @@ describe("keymap: commands and queries", () => {
       new Proxy(target, { get: (target, key) => (key === "title" && armed ? `t${reads++}` : Reflect.get(target, key)) })
     const symbol = Symbol("field")
     const meta = { label: "a" }
+    const nullPrototype = Object.create(null)
+    const deep = nested(16)
     const map = new Map()
     class Tags extends Array {}
     let armed = false
@@ -835,26 +845,28 @@ describe("keymap: commands and queries", () => {
       kept: [0, ["new", "new"], 1],
       "kept, now disabled": [1, ["new", "new"], 0],
       "kept, enabled again": [1, ["new", "new"], 1],
-      "kept, nested function": [0, ["new", "new", "meta new"], 1],
+      "replaced, retained meta": [1, ["new", "old", "meta old"], 1],
       replaced: [1, ["new", "old"], 1],
       "replaced, now disabled": [1, ["new", "old"], 0],
     }
     const rows: [string, object, object, keyof typeof outcomes][] = [
       ["fresh functions", command("old"), command("new"), "kept"],
       [
-        "null-prototype data",
-        command("old", { meta: Object.create(null) }),
-        command("new", { meta: Object.create(null) }),
+        "same null-prototype object",
+        command("old", { meta: nullPrototype }),
+        command("new", { meta: nullPrototype }),
         "kept",
       ],
+      // Object-valued fields compare by identity, as on main: a fresh object is a change, even if equal.
       [
-        "nested function",
+        "fresh object in a field",
         command("old", { meta: { call: () => void calls.push("meta old") } }),
         command("new", { meta: { call: () => void calls.push("meta new") } }),
-        "kept, nested function",
+        "replaced, retained meta",
       ],
       ["proxy that ignores writes", new Proxy(command("old"), { set: () => true }), command("new"), "kept"],
-      ["proxy that throws once registered", throwing(command("old"), () => armed), command("new"), "kept"],
+      // The comparison reads the kept layer's source command too, and a throw there means a full replace.
+      ["proxy that throws once registered", throwing(command("old"), () => armed), command("new"), "replaced"],
       ["enabled same result", command("old", { enabled: () => true }), command("new", { enabled: () => true }), "kept"],
       [
         "enabled flips",
@@ -911,7 +923,7 @@ describe("keymap: commands and queries", () => {
         "replaced",
       ],
       ["function with properties", { name: "c", run: tagged("old") }, { name: "c", run: tagged("new") }, "replaced"],
-      ["deeper than 16", command("old", { meta: nested(16) }), command("new", { meta: nested(16) }), "replaced"],
+      ["deeper than 16", command("old", { meta: deep }), command("new", { meta: deep }), "replaced"],
       ["cycle", command("old", { meta: cyclic() }), command("new", { meta: cyclic() }), "replaced"],
       [
         "own __proto__ key",
@@ -931,8 +943,9 @@ describe("keymap: commands and queries", () => {
         command("new", { meta: throwing({}, () => true) }),
         "replaced",
       ],
-      // Plain data that changed, also in place, and non-plain data mutated in place.
-      ["nested data mutated", command("old", { meta }), command("new", { meta }), "replaced"],
+      // A field holding the same object is unchanged, even if mutated in place (identity, as on main's API);
+      // a non-plain object is never kept.
+      ["same object mutated in place", command("old", { meta }), command("new", { meta }), "kept"],
       ["map mutated in place", command("old", { meta: map }), command("new", { meta: map }), "replaced"],
       ["function to string", command("old", { label: () => "d" }), command("new", { label: "d" }), "replaced"],
       [
@@ -954,7 +967,7 @@ describe("keymap: commands and queries", () => {
       let events = 0
       keymap.on("state", () => void (events += 1))
       armed = true
-      if (change === "nested data mutated") meta.label = "b"
+      if (change === "same object mutated in place") meta.label = "b"
       if (change === "map mutated in place") map.set("key", 1)
       if (change.startsWith("shared flag")) flag = false
       if (change === "shared flag flips back after an event") {
@@ -1220,20 +1233,16 @@ describe("keymap: commands and queries", () => {
     }
   })
 
-  test("a replace compiles from the one read it compares", () => {
+  test("a layer read through a proxy is kept only when what it compiled to is unchanged", () => {
     const keymap = getKeymap(renderer)
     const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
     let reads = 0
-    let armed = false
-    // Once armed, the first read of `title` and every third after it return "t"; the others a new value.
+    // The check and the compile read the proxy separately; every read of `title` returns a new value.
     const layerOf = () => ({
       commands: [
         new Proxy(
           { name: "c", title: "t", run() {} },
-          {
-            get: (target, key) =>
-              key === "title" && armed ? (++reads % 3 === 1 ? "t" : `c${reads}`) : Reflect.get(target, key),
-          },
+          { get: (target, key) => (key === "title" ? `t${reads++}` : Reflect.get(target, key)) },
         ),
       ],
     })
@@ -1241,16 +1250,51 @@ describe("keymap: commands and queries", () => {
     keymap.on("state", () => void (events += 1))
 
     let registered = layers.replaceLayer(undefined, layerOf())
-    armed = true
     const seen: unknown[] = []
     for (let step = 0; step < 2; step += 1) {
       events = 0
       registered = layers.replaceLayer(registered, layerOf())
-      seen.push([events, keymap.getCommands()[0]!.title])
+      const title = keymap.getCommands()[0]!.title as string
+      seen.push([events, title === `t${reads - 1}` || title.startsWith("t")])
     }
     expect(seen).toEqual([
-      [0, "t"],
-      [1, "c2"],
+      [1, true],
+      [1, true],
+    ])
+  })
+
+  test("identity-observed values keep main's identity semantics on registration and replace", () => {
+    const first = { id: 1 }
+    const second = { id: 1 }
+    const results: unknown[] = []
+    for (const field of ["meta", "audience"]) {
+      const keymap = getKeymap(renderer)
+      const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
+      keymap.registerCommandFields({ audience: (value, ctx) => ctx.require("audience", value) })
+      keymap.setData("audience", first)
+      const layerOf = (value: object) => ({ commands: [{ name: "c", [field]: value, run() {} }] })
+      let events = 0
+      keymap.on("state", () => void (events += 1))
+
+      const registered = layers.replaceLayer(undefined, layerOf(first))
+      const exposed = keymap.getCommands({ visibility: "registered" })[0]![field]
+      const matches = () =>
+        field === "meta"
+          ? [
+              keymap.getCommands({ filter: { meta: first } }).length,
+              keymap.getCommands({ filter: { meta: exposed } }).length,
+            ]
+          : [keymap.getCommands().length, keymap.dispatchCommand("c").ok]
+      results.push([field, "registered", ...matches()])
+      events = 0
+      layers.replaceLayer(registered, layerOf(second))
+      results.push([field, "deeply equal object", events, ...matches()])
+    }
+    expect(results).toEqual([
+      ["meta", "registered", 1, 1],
+      ["meta", "deeply equal object", 1, 0, 0],
+      ["audience", "registered", 1, true],
+      ["audience", "deeply equal object", 1, 0, false],
     ])
   })
 

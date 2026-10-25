@@ -3,47 +3,38 @@ function isPlainObject(value: object): boolean {
   return prototype === Object.prototype || prototype === null
 }
 
-export const NOT_PLAIN_DATA = Symbol("not plain data")
 const DEPTH_MAX = 16
-// Compiled data nests the copied data a few levels deeper; the bound only stops cycles a compile hook made.
+// Compiled data nests the checked data a few levels deeper; the bound only stops cycles a compile hook made.
 const COMPILED_DEPTH_MAX = 32
 const PLAIN_FUNCTION_KEYS = new Set<PropertyKey>(["length", "name", "prototype"])
 
-// Copies plain data, reading every value once through the object, so a caller can compile from the copy
-// instead of reading the original again. Plain data is plain objects, arrays and primitives with enumerable
-// string-keyed data properties, and functions with no own properties of their own (kept as they are).
-// Anything else (other prototypes, frozen, sealed or non-extensible objects, accessors, symbol,
-// non-enumerable or `__proto__` keys, cycles or data deeper than 16) returns `NOT_PLAIN_DATA`. The
-// top-level `identityKey` value is kept as it is (a layer's target).
-export function copyPlainData(value: unknown, identityKey?: string, depth = 0): unknown {
-  if (typeof value === "function") return isPlainFunction(value) ? value : NOT_PLAIN_DATA
-  if (typeof value !== "object" || value === null) return value
-
-  const isArray = Array.isArray(value)
-  const plain = isArray ? Object.getPrototypeOf(value) === Array.prototype : isPlainObject(value)
-  if (!plain || !Object.isExtensible(value) || depth >= DEPTH_MAX) return NOT_PLAIN_DATA
-
-  const copy = (isArray ? [] : {}) as Record<string, unknown>
-  for (const key of Reflect.ownKeys(value)) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key)!
-    if (typeof key !== "string" || key === "__proto__" || !("value" in descriptor)) return NOT_PLAIN_DATA
-    if (!descriptor.enumerable && !(isArray && key === "length")) return NOT_PLAIN_DATA
-    const read = Reflect.get(value, key)
-    const entry = depth === 0 && key === identityKey ? read : copyPlainData(read, undefined, depth + 1)
-    if (entry === NOT_PLAIN_DATA) return NOT_PLAIN_DATA
-    copy[key] = entry
-  }
-
-  return copy
-}
-
-// Whether `copyPlainData` accepts a value; a value that throws while read is not plain data.
-export function isPlainData(value: unknown): boolean {
+// Whether a value is plain data: plain objects, arrays and primitives with enumerable string-keyed data
+// properties, and functions with no own properties of their own. Anything else (other prototypes, frozen,
+// sealed or non-extensible objects, accessors, symbol, non-enumerable or `__proto__` keys, cycles or data
+// deeper than 16) is not, and neither is a value that throws while read. The top-level `identityKey` value
+// is not checked (a layer's target).
+export function isPlainData(value: unknown, identityKey?: string): boolean {
   try {
-    return copyPlainData(value) !== NOT_PLAIN_DATA
+    return checkPlainData(value, identityKey, 0)
   } catch {
     return false
   }
+}
+
+function checkPlainData(value: unknown, identityKey: string | undefined, depth: number): boolean {
+  if (typeof value === "function") return isPlainFunction(value)
+  if (typeof value !== "object" || value === null) return true
+
+  const isArray = Array.isArray(value)
+  const plain = isArray ? Object.getPrototypeOf(value) === Array.prototype : isPlainObject(value)
+  if (!plain || !Object.isExtensible(value) || depth >= DEPTH_MAX) return false
+
+  return Reflect.ownKeys(value).every((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)!
+    if (typeof key !== "string" || key === "__proto__" || !("value" in descriptor)) return false
+    if (!descriptor.enumerable && !(isArray && key === "length")) return false
+    return (depth === 0 && key === identityKey) || checkPlainData(Reflect.get(value, key), undefined, depth + 1)
+  })
 }
 
 // Compares compiled layer data through property descriptors, so no getter runs: arrays and plain objects (frozen
