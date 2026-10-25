@@ -45,33 +45,33 @@ function compiledData<TTarget extends object, TEvent extends KeymapEvent>(layer:
   return compiled
 }
 
-const NO_FIELDS = new Set<string>()
-const KEY_FIELD = new Set(["key"])
-
-// The identity boundary of a re-registration. The object-valued fields of the layer, its commands and its
-// bindings are handed back by the API (command fields and attrs, binding attrs) or matched with `Object.is`
-// (exact command filters, `ctx.require` data), so they are never copied and must be the same objects for a
-// layer to be kept; primitives compare by value and functions are replaced by the latest. Only what is
-// compiled into internal structures and not handed back compares by content: the layer, command and binding
-// objects themselves (commands are handed back as keymap-owned objects), their arrays, and binding keys,
-// which compile into key sequences.
-function identityFields(layer: object): unknown[] {
-  const objects = (record: object, skip: ReadonlySet<string>) =>
-    Object.entries(record).flatMap(([key, value]) =>
-      skip.has(key) || typeof value !== "object" || value === null ? [] : [key, value],
-    )
-  const { commands = [], bindings = [] } = layer as { commands?: object[]; bindings?: object[] }
+// The identity boundary of a re-registration, taken from the compiled layer: the object values the API
+// hands back or matches with `Object.is`. Those are the requirement data of the layer, its commands and its
+// bindings (`ctx.require`), command fields and the owned command's data (exact command filters; a proxy can
+// make the two differ), and command and binding attrs. They must be the same objects for a layer to be
+// kept; primitives compare by value and functions are replaced by the latest. Everything else compiled,
+// which is not handed back as it is, compares by content (`sameCompiledData`).
+function exposedObjects<TTarget extends object, TEvent extends KeymapEvent>(
+  layer: RegisteredLayer<TTarget, TEvent>,
+): unknown[] {
+  const objects = (values: readonly unknown[]) => values.filter((value) => typeof value === "object" && value !== null)
+  const conditionData = (target: RuntimeMatchable & { attrs?: object }) => [
+    ...objects(target.requires.map(([, value]) => value)),
+    ...objects(Object.values(target.attrs ?? {})),
+  ]
   return [
-    ...objects(layer, RESERVED_LAYER_FIELDS),
-    ...commands.flatMap((command) => ["command", ...objects(command, NO_FIELDS)]),
-    ...bindings.flatMap((binding) => ["binding", ...objects(binding, KEY_FIELD)]),
+    ...objects(layer.requires.map(([, value]) => value)),
+    ...layer.commands.flatMap((command) => [
+      ...conditionData(command),
+      ...objects(Object.values(command.fields)),
+      ...objects(Object.values(command.command)),
+    ]),
+    ...layer.bindings.flatMap((binding) => conditionData(binding)),
   ]
 }
 
-function sameItems(left: readonly unknown[] | undefined, right: readonly unknown[]): boolean {
-  return (
-    left !== undefined && left.length === right.length && left.every((item, index) => Object.is(item, right[index]))
-  )
+function sameItems(left: readonly unknown[], right: readonly unknown[]): boolean {
+  return left.length === right.length && left.every((item, index) => Object.is(item, right[index]))
 }
 
 function conditionTargets<TTarget extends object, TEvent extends KeymapEvent>(
@@ -144,10 +144,9 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
   activation: ActivationService<TTarget, TEvent>,
   options: LayersOptions<TTarget, TEvent>,
 ): LayerService<TTarget, TEvent> {
-  // The identity-observed values of layers that `replaceLayer` registered from plain data (see
-  // `identityFields`), and the last result of each of their
-  // `enabled` conditions that `state` listeners have seen (at registration or at the last event).
-  const identities = new WeakMap<RegisteredLayer<TTarget, TEvent>, unknown[]>()
+  // Layers that `replaceLayer` registered from plain data, and the last result of each of their `enabled`
+  // conditions that `state` listeners have seen (at registration or at the last event).
+  const plainLayers = new WeakSet<RegisteredLayer<TTarget, TEvent>>()
   const seenEnabled = new WeakMap<RuntimeMatchable, boolean>()
 
   const recordEnabled = (layer: RegisteredLayer<TTarget, TEvent>): void => {
@@ -157,7 +156,7 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
   }
 
   notify.onStateEvent(() => {
-    for (const layer of state.layers) if (identities.has(layer)) recordEnabled(layer)
+    for (const layer of state.layers) if (plainLayers.has(layer)) recordEnabled(layer)
   })
 
   const registerLayer = (layer: Layer<TTarget, TEvent>): (() => void) => {
@@ -170,21 +169,19 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
   }
 
   // Replaces `previous` in one state batch, in its position: precedence follows mount order. A plain-data
-  // layer whose identity-observed values are the same objects (see `identityFields`) and whose compiled data
-  // matches `previous` (functions aside) keeps the registered objects, which then call the new functions;
-  // `state` fires only if an `enabled` result differs from the one listeners have seen. Anything else takes
-  // the full replace. The layer is read twice (checked, then compiled), so a proxy that returns other values
-  // on the second read can leave stale labels; dispatch always uses what was compiled.
+  // layer whose compiled data holds the same exposed objects (see `exposedObjects`) and otherwise matches
+  // `previous` (functions aside) keeps the registered objects, which then call the new functions; `state`
+  // fires only if an `enabled` result differs from the one listeners have seen. Anything else takes the full
+  // replace. The decision uses only the compiled layer, so what it compares is what queries and dispatch use.
   const replaceLayer = (
     previous: RegisteredLayer<TTarget, TEvent> | undefined,
     layer: Layer<TTarget, TEvent> | undefined,
   ): RegisteredLayer<TTarget, TEvent> | undefined => {
     return notify.runWithStateChangeBatch(() => {
       const kept = previous && state.layers.has(previous) ? previous : undefined
-      const identity = layer && isPlainData(layer, "target") ? identityFields(layer) : undefined
-      const next = layer && compileLayer(layer, identity !== undefined, kept?.order)
-      const sameIdentity = kept && identity && sameItems(identities.get(kept), identity)
-      if (kept && next && sameIdentity && sameCompiledLayer(kept, next)) {
+      const plain = layer !== undefined && isPlainData(layer, "target")
+      const next = layer && compileLayer(layer, plain, kept?.order)
+      if (kept && next && plainLayers.has(kept) && sameCompiledLayer(kept, next)) {
         refreshLayer(kept, next)
         return kept
       }
@@ -194,8 +191,8 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
       if (!next) return undefined
 
       addLayer(next)
-      if (identity) {
-        identities.set(next, identity)
+      if (plain) {
+        plainLayers.add(next)
         recordEnabled(next)
       }
       if (position >= 0) {
@@ -214,6 +211,7 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
     if (kept.target !== next.target) return false
     if (conditionTargets(next).some((target) => target.matchers.some((matcher) => matcher.subscribe))) return false
     try {
+      if (!sameItems(exposedObjects(kept), exposedObjects(next))) return false
       return sameCompiledData(compiledData(kept), compiledData(next), kept.target)
     } catch {
       return false
@@ -309,7 +307,7 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
   }
 
   // Moves the new compiled state into the keymap's own objects. Owned command objects keep their methods,
-  // which call the new `source`; their data values are the same objects (see `identityFields`).
+  // which call the new `source`; their data values are the same objects (see `exposedObjects`).
   const refreshLayer = (previous: RegisteredLayer<TTarget, TEvent>, next: RegisteredLayer<TTarget, TEvent>): void => {
     const nextTargets = conditionTargets(next)
     let changed = false

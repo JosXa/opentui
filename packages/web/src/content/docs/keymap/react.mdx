@@ -106,15 +106,15 @@ If the layer is plain data and differs from the registered one only in its funct
 `enabled` closures, the hook keeps the registered layer. Plain data means plain objects, arrays and primitives with
 enumerable string keys, and functions without properties of their own, from the layer object down; no class
 instances, `Map`s, getters, symbol or `__proto__` keys, or frozen or sealed objects. A store proxy that reports
-getters is registered anew; spread it to pass plain data. Object-valued fields of the layer, its commands and its
-bindings must be the same objects as before, because the keymap hands them back and command filters and `require`
-match them by identity: a new object, even an equal one, registers the layer anew, and an object changed in place
-does not. Binding keys and the layer, command and binding objects themselves compare by content. When the layer is
-kept, command objects read from the keymap earlier call the new functions, and a pending key sequence continues.
-`state` is emitted only if an `enabled` condition gives a different result from the one listeners last saw; other
-function results, such as a `title` function, are not compared. Commands of such a layer are returned as
-keymap-owned objects, not as the objects passed in. Any other layer, and any layer with a reactive matcher, is
-replaced as a new registration in the same position.
+getters is registered anew; spread it to pass plain data. Object values that the keymap hands back or matches by
+identity must be the same objects as before: command fields, command and binding attrs, and requirement data, also
+when a field compiler produces them. Command filters and `require` match them by identity, so a new object, even an
+equal one, registers the layer anew, and an object changed in place does not. Binding keys and the layer, command
+and binding objects themselves compare by content. When the layer is kept, command objects read from the keymap
+earlier call the new functions, and a pending key sequence continues. `state` is emitted only if an `enabled`
+condition gives a different result from the one listeners last saw; other function results, such as a `title`
+function, are not compared. Commands of such a layer are returned as keymap-owned objects, not as the objects passed
+in. Any other layer, and any layer with a reactive matcher, is replaced as a new registration in the same position.
 
 The layer can include Core fields such as `priority`, `bindings`, and `commands`.
 It can also include fields from installed addons, such as `enabled`.

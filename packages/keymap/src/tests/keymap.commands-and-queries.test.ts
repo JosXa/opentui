@@ -1199,7 +1199,7 @@ describe("keymap: commands and queries", () => {
           },
         })),
       ],
-      // Compared through its descriptors, which are equal, so the layer is kept without running the trap.
+      // A fresh attr object is a change (identity); the comparison does not run its trap.
       ["attr proxy whose reads run code", attr(() => new Proxy({ label: "0" }, { get: () => String(getterRuns++) }))],
       [
         "getter attr in the kept layer",
@@ -1229,7 +1229,7 @@ describe("keymap: commands and queries", () => {
       layers.replaceLayer(registered, layerOf("new"))
       calls.length = 0
       keymap.runCommand("c")
-      expect([hook, events, calls, getterRuns]).toEqual([hook, hook.startsWith("attr proxy") ? 0 : 1, ["new"], 0])
+      expect([hook, events, calls, getterRuns]).toEqual([hook, 1, ["new"], 0])
     }
   })
 
@@ -1296,6 +1296,103 @@ describe("keymap: commands and queries", () => {
       ["audience", "registered", 1, true],
       ["audience", "deeply equal object", 1, 0, false],
     ])
+  })
+
+  test("compiled values the API exposes compare by identity, whatever the compile read", () => {
+    const requirement = { id: 1 }
+    const fresh = () => ({ id: 1 })
+    const rows: [
+      string,
+      (keymap: OpenTuiKeymap) => void,
+      (label: string, compile: number) => object,
+      (keymap: OpenTuiKeymap) => unknown,
+    ][] = [
+      [
+        "command attr from a field compiler",
+        (keymap) => keymap.registerCommandFields({ meta: (_value, ctx) => ctx.attr("meta", fresh()) }),
+        () => ({ commands: [{ name: "c", meta: 1, run() {} }], bindings: [{ key: "x", cmd: "c" }] }),
+        (keymap) => keymap.getActiveKeys({ includeMetadata: true })[0]?.commandAttrs?.meta,
+      ],
+      [
+        "requirement from a field compiler",
+        (keymap) =>
+          keymap.registerCommandFields({
+            audience: (_value, ctx) => ctx.require("audience", compiles++ === 0 ? requirement : fresh()),
+          }),
+        () => ({ commands: [{ name: "c", audience: 1, run() {} }] }),
+        (keymap) => keymap.dispatchCommand("c").ok,
+      ],
+      [
+        "binding attr from a field compiler",
+        (keymap) => keymap.registerBindingFields({ meta: (_value, ctx) => ctx.attr("meta", fresh()) }),
+        () => ({ commands: [{ name: "c", run() {} }], bindings: [{ key: "x", cmd: "c", meta: 1 }] }),
+        (keymap) => keymap.getCommandBindings({ commands: ["c"] }).get("c")?.[0]?.attrs?.meta,
+      ],
+      [
+        "layer requirement from a field compiler",
+        (keymap) =>
+          keymap.registerLayerFields({
+            audience: (_value, ctx) => ctx.require("audience", compiles++ === 0 ? requirement : fresh()),
+          }),
+        () => ({ audience: 1, commands: [{ name: "c", run() {} }] }),
+        (keymap) => keymap.dispatchCommand("c").ok,
+      ],
+      [
+        // The check reads `audience` once; later reads (the compile) return an equal new object.
+        "requirement read through a proxy",
+        (keymap) => keymap.registerCommandFields({ audience: (value, ctx) => ctx.require("audience", value) }),
+        (_label, compile) => {
+          let reads = 0
+          const command = { name: "c", audience: requirement, run() {} }
+          if (compile === 0) return { commands: [command] }
+          return {
+            commands: [
+              new Proxy(command, {
+                get: (target, key) => (key === "audience" && reads++ > 1 ? fresh() : Reflect.get(target, key)),
+              }),
+            ],
+          }
+        },
+        (keymap) => keymap.dispatchCommand("c").ok,
+      ],
+      [
+        // The check and the owned command read `meta` as the original; the fields read in between does not.
+        "command field read through a proxy",
+        () => {},
+        (_label, compile) => {
+          let reads = 0
+          const command = { name: "c", meta: requirement, run() {} }
+          if (compile === 0) return { commands: [command] }
+          return {
+            commands: [
+              new Proxy(command, {
+                get: (target, key) => (key === "meta" && reads++ === 1 ? fresh() : Reflect.get(target, key)),
+              }),
+            ],
+          }
+        },
+        (keymap) => keymap.getCommands({ filter: { meta: requirement } }).length,
+      ],
+    ]
+    let compiles = 0
+
+    for (const [change, install, layerOf, observe] of rows) {
+      const keymap = getKeymap(renderer)
+      const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
+      install(keymap)
+      keymap.setData("audience", requirement)
+      compiles = 0
+      const registered = layers.replaceLayer(undefined, layerOf("old", 0) as never)
+      const before = observe(keymap)
+      let events = 0
+      keymap.on("state", () => void (events += 1))
+
+      layers.replaceLayer(registered, layerOf("new", 1) as never)
+      const after = observe(keymap)
+      // As on main: the new compiled object (or dispatch result) is announced with a state event.
+      const result = typeof after === "boolean" ? after : before !== after
+      expect([change, events > 0, result]).toEqual([change, true, !change.includes("requirement from")])
+    }
   })
 
   test("a failed reactive subscription is retried by the next replace", () => {
