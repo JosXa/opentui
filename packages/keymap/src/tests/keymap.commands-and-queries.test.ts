@@ -791,10 +791,9 @@ describe("keymap: commands and queries", () => {
     }
   })
 
-  test("a replace keeps the command objects callers hold and calls the latest functions", () => {
+  test("a replace keeps a plain-data layer's objects and fully replaces anything else", () => {
     const calls: string[] = []
-    const command = (label: string, extra: object = {}) =>
-      Object.freeze({ name: "c", run: () => void calls.push(label), ...extra })
+    const command = (label: string, extra: object = {}) => ({ name: "c", run: () => void calls.push(label), ...extra })
     const getter = (label: string) => ({
       name: "c",
       get title() {
@@ -804,6 +803,7 @@ describe("keymap: commands and queries", () => {
     })
     const hidden = (label: string) =>
       Object.defineProperty({ name: "c" }, "run", { value: () => void calls.push(label) })
+    const tagged = (label: string) => Object.assign(() => void calls.push(label), { tag: label })
     const throwing = (target: object, when: () => boolean) =>
       new Proxy(target, {
         ownKeys: (target) => {
@@ -811,27 +811,40 @@ describe("keymap: commands and queries", () => {
           return Reflect.ownKeys(target)
         },
       })
-    const meta = { label: "a" }
+    const nested = (depth: number): object => (depth === 0 ? {} : { inner: nested(depth - 1) })
     const symbol = Symbol("field")
+    const meta = { label: "a" }
+    const map = new Map()
+    class Tags extends Array {}
     let armed = false
-    // [state events, calls of `runCommand` then of a `run` read before the replace, visible commands]. A kept
-    // layer's retained `run` forwards to the new one; a replaced layer's is the caller's old function.
+    let flag = true
+    const enabled = () => flag
+    // [state events, calls of `runCommand`, of a `run` read before the replace and of its `meta.call`, visible
+    // commands]. A kept layer's retained objects call the new functions; a replaced layer's are the caller's.
     const outcomes = {
       kept: [0, ["new", "new"], 1],
       "kept, now disabled": [1, ["new", "new"], 0],
+      "kept, enabled again": [1, ["new", "new"], 1],
+      "kept, nested function": [0, ["new", "new", "meta new"], 1],
       replaced: [1, ["new", "old"], 1],
       "replaced, now disabled": [1, ["new", "old"], 0],
     }
     const rows: [string, object, object, keyof typeof outcomes][] = [
       ["fresh functions", command("old"), command("new"), "kept"],
+      [
+        "null-prototype data",
+        command("old", { meta: Object.create(null) }),
+        command("new", { meta: Object.create(null) }),
+        "kept",
+      ],
+      [
+        "nested function",
+        command("old", { meta: { call: () => void calls.push("meta old") } }),
+        command("new", { meta: { call: () => void calls.push("meta new") } }),
+        "kept, nested function",
+      ],
       ["proxy that ignores writes", new Proxy(command("old"), { set: () => true }), command("new"), "kept"],
       ["proxy that throws once registered", throwing(command("old"), () => armed), command("new"), "kept"],
-      ["getter", getter("old"), getter("new"), "replaced"],
-      ["non-enumerable run", hidden("old"), hidden("new"), "replaced"],
-      ["symbol field", command("old", { [symbol]: 1 }), command("new", { [symbol]: 2 }), "replaced"],
-      ["nested data mutated", command("old", { meta }), command("new", { meta }), "replaced"],
-      ["nested proxy that throws", command("old", { meta: throwing({}, () => true) }), command("new"), "replaced"],
-      ["function to string", command("old", { label: () => "d" }), command("new", { label: "d" }), "replaced"],
       ["enabled same result", command("old", { enabled: () => true }), command("new", { enabled: () => true }), "kept"],
       [
         "enabled flips",
@@ -839,6 +852,65 @@ describe("keymap: commands and queries", () => {
         command("new", { enabled: () => false }),
         "kept, now disabled",
       ],
+      [
+        "shared flag flips, fresh closure",
+        command("old", { enabled: () => flag }),
+        command("new", { enabled: () => flag }),
+        "kept, now disabled",
+      ],
+      [
+        "shared flag flips, same function",
+        command("old", { enabled }),
+        command("new", { enabled }),
+        "kept, now disabled",
+      ],
+      [
+        "shared flag flips back after an event",
+        command("old", { enabled }),
+        command("new", { enabled }),
+        "kept, enabled again",
+      ],
+      // One row per rule that the plain-data check enforces.
+      ["class instance", command("old", { meta: new Map() }), command("new", { meta: new Map() }), "replaced"],
+      [
+        "array subclass",
+        command("old", { tags: Tags.from([1]) }),
+        command("new", { tags: Tags.from([1]) }),
+        "replaced",
+      ],
+      ["symbol key", command("old", { [symbol]: 1 }), command("new", { [symbol]: 1 }), "replaced"],
+      [
+        "symbol key on an array",
+        command("old", { tags: Object.assign([1], { [symbol]: 1 }) }),
+        command("new", { tags: Object.assign([1], { [symbol]: 1 }) }),
+        "replaced",
+      ],
+      ["getter", getter("old"), getter("new"), "replaced"],
+      ["non-enumerable key", hidden("old"), hidden("new"), "replaced"],
+      [
+        "frozen object",
+        command("old", { meta: Object.freeze({}) }),
+        command("new", { meta: Object.freeze({}) }),
+        "replaced",
+      ],
+      [
+        "sealed object",
+        command("old", { meta: Object.seal({}) }),
+        command("new", { meta: Object.seal({}) }),
+        "replaced",
+      ],
+      ["function with properties", { name: "c", run: tagged("old") }, { name: "c", run: tagged("new") }, "replaced"],
+      ["deeper than 16", command("old", { meta: nested(16) }), command("new", { meta: nested(16) }), "replaced"],
+      [
+        "reading it throws",
+        command("old", { meta: throwing({}, () => true) }),
+        command("new", { meta: throwing({}, () => true) }),
+        "replaced",
+      ],
+      // Plain data that changed, also in place, and non-plain data mutated in place.
+      ["nested data mutated", command("old", { meta }), command("new", { meta }), "replaced"],
+      ["map mutated in place", command("old", { meta: map }), command("new", { meta: map }), "replaced"],
+      ["function to string", command("old", { label: () => "d" }), command("new", { label: "d" }), "replaced"],
       [
         "enabled to boolean",
         command("old", { enabled: () => true }),
@@ -851,18 +923,30 @@ describe("keymap: commands and queries", () => {
       const keymap = getKeymap(renderer)
       const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
       armed = false
+      flag = true
+      const copies = [{ ...first }, { ...next }]
       const registered = layers.replaceLayer(undefined, { commands: [first as Command] })
-      const retained = keymap.getCommands({ visibility: "registered" })[0]!.run
-      armed = true
-      if (change === "nested data mutated") meta.label = "b"
+      const retained = keymap.getCommands({ visibility: "registered" })[0]!
       let events = 0
       keymap.on("state", () => void (events += 1))
+      armed = true
+      if (change === "nested data mutated") meta.label = "b"
+      if (change === "map mutated in place") map.set("key", 1)
+      if (change.startsWith("shared flag")) flag = false
+      if (change === "shared flag flips back after an event") {
+        keymap.setData("unrelated", 1)
+        flag = true
+      }
 
+      events = 0
       layers.replaceLayer(registered, { commands: [next as Command] })
       calls.length = 0
       keymap.runCommand("c")
-      retained({} as never)
+      retained.run({} as never)
+      ;(retained.meta as { call?: () => void } | undefined)?.call?.()
       expect([change, events, calls, keymap.getCommands().length]).toEqual([change, ...outcomes[outcome]])
+      armed = false
+      expect([{ ...first }, { ...next }]).toEqual(copies)
     }
   })
 
@@ -892,6 +976,23 @@ describe("keymap: commands and queries", () => {
     ])
   })
 
+  test("a replace with another target or after a compile registry changed is a full replace", () => {
+    const keymap = getKeymap(renderer)
+    const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
+    const layerOf = (target?: Renderable) => ({ target, commands: [{ name: "c", run() {} }] })
+    let events = 0
+    keymap.on("state", () => void (events += 1))
+
+    let registered = layers.replaceLayer(undefined, layerOf(createFocusableBox("first")))
+    events = 0
+    registered = layers.replaceLayer(registered, layerOf(createFocusableBox("second")))
+    const afterTarget = events
+    keymap.appendCommandTransformer(() => {})
+    events = 0
+    layers.replaceLayer(registered, layerOf(registered!.target))
+    expect([afterTarget, events]).toEqual([1, 1])
+  })
+
   test("a failed reactive subscription is retried by the next replace", () => {
     const keymap = getKeymap(renderer)
     const { takeErrors } = captureDiagnostics(keymap)
@@ -919,7 +1020,7 @@ describe("keymap: commands and queries", () => {
     const keymap = getKeymap(renderer)
     const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
     const calls: string[] = []
-    const shared = Object.freeze({ name: "c", run: () => void calls.push("shared") })
+    const shared = { name: "c", run: () => void calls.push("shared") }
 
     const replaced = layers.replaceLayer(undefined, { commands: [shared] })
     layers.replaceLayer(undefined, { priority: -1, commands: [shared] })
@@ -928,6 +1029,14 @@ describe("keymap: commands and queries", () => {
     layers.replaceLayer(replaced, undefined)
     keymap.runCommand("c")
     expect(calls).toEqual(["fresh", "shared"])
+  })
+
+  test("registerLayer still rejects a frozen command, whose name it normalizes in place", () => {
+    const keymap = getKeymap(renderer)
+    const { takeErrors } = captureDiagnostics(keymap)
+
+    keymap.registerLayer({ commands: [Object.freeze({ name: "c", run() {} })] })
+    expect([keymap.getCommands().length, takeErrors().errors.length]).toEqual([0, 1])
   })
 
   test("getCommands returns the registered command object across repeated reads", () => {

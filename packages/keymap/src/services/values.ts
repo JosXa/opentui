@@ -3,45 +3,54 @@ function isPlainObject(value: object): boolean {
   return prototype === Object.prototype || prototype === null
 }
 
-// A plain object whose own keys are all strings with enumerable data properties: safe to copy by value.
-export function isPlainDataObject(value: object): boolean {
-  return (
-    isPlainObject(value) &&
-    Reflect.ownKeys(value).every((key) => {
-      const descriptor = typeof key === "string" ? Object.getOwnPropertyDescriptor(value, key) : undefined
-      return descriptor !== undefined && descriptor.enumerable === true && "value" in descriptor
-    })
-  )
+export const NOT_PLAIN_DATA = Symbol("not plain data")
+const FUNCTION_DATA = Symbol("function")
+const PLAIN_DATA_DEPTH_MAX = 16
+const PLAIN_FUNCTION_KEYS = new Set<PropertyKey>(["length", "name", "prototype"])
+
+// Copies plain data for a later `samePlainData`, with every function as one marker. Plain data is plain
+// objects, arrays and primitives with enumerable string-keyed data properties, and functions with no own
+// properties of their own. Anything else (other prototypes, frozen, sealed or non-extensible objects,
+// accessors, symbol or non-enumerable keys, data deeper than 16) returns `NOT_PLAIN_DATA`. A proxy cannot be
+// told apart portably; one that behaves as plain data is read as plain data, and nothing is written to it.
+export function snapshotPlainData(value: unknown, depth = 0): unknown {
+  if (typeof value === "function") {
+    return Reflect.ownKeys(value).every((key) => PLAIN_FUNCTION_KEYS.has(key)) ? FUNCTION_DATA : NOT_PLAIN_DATA
+  }
+  if (typeof value !== "object" || value === null) return value
+
+  const isArray = Array.isArray(value)
+  const plain = isArray ? Object.getPrototypeOf(value) === Array.prototype : isPlainObject(value)
+  if (!plain || !Object.isExtensible(value) || depth >= PLAIN_DATA_DEPTH_MAX) return NOT_PLAIN_DATA
+
+  const copy = (isArray ? [] : {}) as Record<string, unknown>
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)!
+    if (typeof key !== "string" || !("value" in descriptor)) return NOT_PLAIN_DATA
+    if (!descriptor.enumerable && !(isArray && key === "length")) return NOT_PLAIN_DATA
+    const entry = snapshotPlainData(descriptor.value, depth + 1)
+    if (entry === NOT_PLAIN_DATA) return NOT_PLAIN_DATA
+    copy[key] = entry
+  }
+
+  return copy
 }
 
-// Bounds the copy; deeper or cyclic data gets a unique marker, so it compares unequal and costs a replace.
-const SHAPE_DEPTH_MAX = 16
-const FUNCTION_SHAPE = Symbol("function")
-
-// Copies arrays and plain objects (symbol keys included) and replaces every function with one marker, so
-// a later `sameShape` sees in-place mutations and treats any two functions as equal.
-export function snapshotShape(value: unknown, depth = 0): unknown {
-  if (typeof value === "function") return FUNCTION_SHAPE
-  if (!isShapeContainer(value)) return value
-  if (depth >= SHAPE_DEPTH_MAX) return Symbol("too deep")
-  if (Array.isArray(value)) return value.map((entry) => snapshotShape(entry, depth + 1))
-  return Object.fromEntries(Reflect.ownKeys(value).map((key) => [key, snapshotShape(value[key], depth + 1)]))
-}
-
-// Compares two `snapshotShape` results: containers by content, everything else by identity.
-export function sameShape(left: unknown, right: unknown): boolean {
+// Compares two `snapshotPlainData` copies; values outside them (targets, registries) compare by identity.
+export function samePlainData(left: unknown, right: unknown): boolean {
   if (Object.is(left, right)) return true
-  if (!isShapeContainer(left) || !isShapeContainer(right)) return false
-  if (Array.isArray(left) !== Array.isArray(right)) return false
+  if (!isPlainContainer(left) || !isPlainContainer(right) || Array.isArray(left) !== Array.isArray(right)) {
+    return false
+  }
 
-  const keys = Reflect.ownKeys(left)
+  const keys = Reflect.ownKeys(left) as string[]
   return (
     keys.length === Reflect.ownKeys(right).length &&
-    keys.every((key) => Object.hasOwn(right, key) && sameShape(left[key], right[key]))
+    keys.every((key) => Object.hasOwn(right, key) && samePlainData(left[key], right[key]))
   )
 }
 
-function isShapeContainer(value: unknown): value is Record<PropertyKey, unknown> {
+function isPlainContainer(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && (Array.isArray(value) || isPlainObject(value))
 }
 

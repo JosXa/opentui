@@ -25,7 +25,7 @@ import type { NotificationService } from "./notify.js"
 import { snapshotBindings, validateBindings } from "./primitives/bindings.js"
 import { createFieldCompilerContext } from "./primitives/field-invariants.js"
 import { buildSequenceTree } from "./sequence-index.js"
-import { getErrorMessage, sameShape, snapshotDataValue, snapshotShape } from "./values.js"
+import { getErrorMessage, NOT_PLAIN_DATA, samePlainData, snapshotDataValue, snapshotPlainData } from "./values.js"
 
 const NOOP = (): void => {}
 
@@ -37,35 +37,10 @@ function compareLayers<TTarget extends object, TEvent extends KeymapEvent>(
   return priorityDiff || right.order - left.order
 }
 
-// Everything a re-registration compares, copied when the layer is compiled; `source` is the caller's object.
-function snapshotLayerShape<TTarget extends object, TEvent extends KeymapEvent>(
+function conditionTargets<TTarget extends object, TEvent extends KeymapEvent>(
   layer: RegisteredLayer<TTarget, TEvent>,
-): unknown {
-  const { target, targetMode, priority, requires, matchers, fields, attrs, sourceBindings, bindings } = layer
-  const commands = layer.commands.map(({ source: _source, ...command }) => command)
-  return snapshotShape([
-    target,
-    targetMode,
-    priority,
-    requires,
-    matchers,
-    fields,
-    attrs,
-    commands,
-    sourceBindings,
-    bindings,
-  ])
-}
-
-// Reactive matchers subscribe on registration, and caller-shaped commands cannot forward to new functions.
-function layerNeedsReplace<TTarget extends object, TEvent extends KeymapEvent>(
-  layer: RegisteredLayer<TTarget, TEvent>,
-): boolean {
-  const targets: RuntimeMatchable[] = [layer, ...layer.commands, ...layer.bindings]
-  return (
-    targets.some((target) => target.matchers.some((matcher) => matcher.subscribe)) ||
-    layer.commands.some((command) => command.command === command.source)
-  )
+): RuntimeMatchable[] {
+  return [layer, ...layer.commands, ...layer.bindings]
 }
 
 function layerBlocksActiveKeyCache<TTarget extends object, TEvent extends KeymapEvent>(
@@ -132,8 +107,20 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
   activation: ActivationService<TTarget, TEvent>,
   options: LayersOptions<TTarget, TEvent>,
 ): LayerService<TTarget, TEvent> {
-  // Shapes of the layers that `replaceLayer` registered, copied at compile time.
+  // For layers that `replaceLayer` registered from plain data: a copy of that data, and the last result of
+  // each `enabled` condition that `state` listeners have seen (at registration or at the last event).
   const shapes = new WeakMap<RegisteredLayer<TTarget, TEvent>, unknown>()
+  const seenEnabled = new WeakMap<RuntimeMatchable, boolean>()
+
+  const recordEnabled = (layer: RegisteredLayer<TTarget, TEvent>): void => {
+    for (const target of conditionTargets(layer)) {
+      if (target.matchers.length > 0) seenEnabled.set(target, conditions.matchesConditions(target))
+    }
+  }
+
+  notify.onStateEvent(() => {
+    for (const layer of state.layers) if (shapes.has(layer)) recordEnabled(layer)
+  })
 
   const registerLayer = (layer: Layer<TTarget, TEvent>): (() => void) => {
     return notify.runWithStateChangeBatch(() => {
@@ -144,19 +131,23 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
     })
   }
 
-  // Replaces `previous` in one state batch, in its position: precedence follows mount order. A layer
-  // whose data matches `previous` (functions aside) keeps the registered objects, which then call the
-  // new functions, and emits `state` only if an `enabled` result changed.
+  // Replaces `previous` in one state batch, in its position: precedence follows mount order. A layer whose
+  // plain data matches `previous` (functions aside) keeps the registered objects, which then call the new
+  // functions, and emits `state` only if an `enabled` result differs from the one listeners have seen.
+  // Anything else takes the full replace.
   const replaceLayer = (
     previous: RegisteredLayer<TTarget, TEvent> | undefined,
     layer: Layer<TTarget, TEvent> | undefined,
   ): RegisteredLayer<TTarget, TEvent> | undefined => {
     return notify.runWithStateChangeBatch(() => {
       const kept = previous && state.layers.has(previous) ? previous : undefined
-      const next = layer && compileLayer(layer, true, kept?.order)
-      const shape = next && snapshotShapeOrUndefined(next)
-      if (kept && next && shape !== undefined && canRefresh(kept, next, shape)) {
-        refreshLayer(kept, next, shape)
+      const shape = layer && snapshotLayer(layer)
+      const next = layer && compileLayer(layer, shape !== undefined, kept?.order)
+      const keptShape = kept && shapes.get(kept)
+      // Reactive matchers subscribe on registration, so a layer with one is always replaced.
+      const reactive = next && conditionTargets(next).some((target) => target.matchers.some((m) => m.subscribe))
+      if (kept && next && shape && keptShape && !reactive && samePlainData(keptShape, shape)) {
+        refreshLayer(kept, next)
         return kept
       }
 
@@ -165,7 +156,10 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
       if (!next) return undefined
 
       addLayer(next)
-      shapes.set(next, shape)
+      if (shape) {
+        shapes.set(next, shape)
+        recordEnabled(next)
+      }
       if (position >= 0) {
         // `state.layers` keeps registration order, which the "registered" command view reports.
         const layers = [...state.layers].filter((layer) => layer !== next)
@@ -176,27 +170,20 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
     })
   }
 
-  // A caller's proxy or getter may throw; the layer is then replaced instead of compared.
-  const snapshotShapeOrUndefined = (layer: RegisteredLayer<TTarget, TEvent>): unknown => {
+  // What a re-registration compares: the target and the compile registries by identity, and a copy of the
+  // rest of the layer. Undefined when that is not plain data, or when reading it throws.
+  const snapshotLayer = (layer: Layer<TTarget, TEvent>): unknown[] | undefined => {
     try {
-      return snapshotLayerShape(layer)
+      const { target, ...data } = layer
+      const copy = snapshotPlainData(data)
+      if (copy === NOT_PLAIN_DATA) return undefined
+      const { layerBindingsTransformers, bindingExpanders, bindingParsers, bindingTransformers } = state
+      const registries = [layerBindingsTransformers, bindingExpanders, bindingParsers, bindingTransformers]
+      const fields = [...state.layerFields.values(), ...state.bindingFields.values(), ...state.commandFields.values()]
+      return [target, copy, fields, state.commandTransformers.values(), ...registries.map((item) => item.values())]
     } catch {
       return undefined
     }
-  }
-
-  const canRefresh = (
-    previous: RegisteredLayer<TTarget, TEvent>,
-    next: RegisteredLayer<TTarget, TEvent>,
-    shape: unknown,
-  ): boolean => {
-    const previousShape = shapes.get(previous)
-    return (
-      previousShape !== undefined &&
-      !layerNeedsReplace(previous) &&
-      !layerNeedsReplace(next) &&
-      sameShape(previousShape, shape)
-    )
   }
 
   const compileLayer = (
@@ -287,29 +274,28 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
     notify.queueStateChange()
   }
 
-  // Moves the new compiled state into the keymap's own objects; the command objects that callers hold
-  // forward to the new `source`. Only keymap-owned objects are written.
-  const refreshLayer = (
-    previous: RegisteredLayer<TTarget, TEvent>,
-    next: RegisteredLayer<TTarget, TEvent>,
-    shape: unknown,
-  ): void => {
-    // Each `enabled` result is evaluated once on each side, and only where a matcher function changed.
-    const enabledChanged = (old: RuntimeMatchable, fresh: RuntimeMatchable): boolean =>
-      old.matchers.some((matcher, index) => matcher.match !== fresh.matchers[index]!.match) &&
-      conditions.matchesConditions(old) !== conditions.matchesConditions(fresh)
-    const changed =
-      enabledChanged(previous, next) ||
-      previous.commands.some((command, index) => enabledChanged(command, next.commands[index]!)) ||
-      previous.bindings.some((binding, index) => enabledChanged(binding, next.bindings[index]!))
+  // Moves the new compiled state into the keymap's own objects. Owned command objects keep their methods,
+  // which call the new `source`, and take its data, so nested functions are the latest too.
+  const refreshLayer = (previous: RegisteredLayer<TTarget, TEvent>, next: RegisteredLayer<TTarget, TEvent>): void => {
+    const nextTargets = conditionTargets(next)
+    let changed = false
+    conditionTargets(previous).forEach((target, index) => {
+      const fresh = nextTargets[index]!
+      if (fresh.matchers.length === 0) return
+      const enabled = conditions.matchesConditions(fresh)
+      changed ||= seenEnabled.get(target) !== enabled
+      seenEnabled.set(target, enabled)
+    })
 
     previous.commands.forEach((command, index) => {
       Object.assign(command, next.commands[index], { command: command.command })
+      for (const [key, value] of Object.entries(command.source)) {
+        if (key !== "name" && typeof value !== "function") (command.command as Record<string, unknown>)[key] = value
+      }
     })
     previous.bindings.forEach((binding, index) => Object.assign(binding, next.bindings[index]))
     const { requires, matchers, fields, attrs, sourceBindings } = next
     Object.assign(previous, { requires, matchers, fields, attrs, sourceBindings })
-    shapes.set(previous, shape)
 
     if (changed) {
       notify.queueStateChange()
