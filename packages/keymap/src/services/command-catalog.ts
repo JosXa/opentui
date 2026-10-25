@@ -25,7 +25,7 @@ import type { ConditionService } from "./conditions.js"
 import { createFieldCompilerContext } from "./primitives/field-invariants.js"
 import type { NotificationService } from "./notify.js"
 import type { ActiveCommandView, LayerCommandEntry, CommandView, ResolvedCommandEntry, State } from "./state.js"
-import { getErrorMessage } from "./values.js"
+import { getErrorMessage, isPlainDataObject } from "./values.js"
 
 const DEFAULT_COMMAND_SEARCH_FIELDS = ["name"] as const
 
@@ -34,6 +34,8 @@ const commandSearchCache = new WeakMap<CommandState<any, any>, Map<string, strin
 
 interface NormalizeCommandsOptions<TTarget extends object, TEvent extends KeymapEvent> {
   commands: readonly Command<TTarget, TEvent>[]
+  /** Hand out keymap-owned command objects (layers that `replaceLayer` registers). */
+  owned: boolean
   commandFields: ReadonlyMap<string, CommandFieldCompiler>
   conditions: ConditionService<TTarget, TEvent>
   onError(code: string, error: unknown, message: string): void
@@ -71,7 +73,7 @@ interface CommandResolverAttempt<TTarget extends object, TEvent extends KeymapEv
 }
 
 export interface CommandCatalogService<TTarget extends object, TEvent extends KeymapEvent> {
-  normalizeCommands(commands: readonly Command<TTarget, TEvent>[]): CommandState<TTarget, TEvent>[]
+  normalizeCommands(commands: readonly Command<TTarget, TEvent>[], owned: boolean): CommandState<TTarget, TEvent>[]
   prependCommandResolver(resolver: CommandResolver<TTarget, TEvent>): () => void
   appendCommandResolver(resolver: CommandResolver<TTarget, TEvent>): () => void
   clearCommandResolvers(): void
@@ -142,9 +144,13 @@ export function createCommandCatalogService<TTarget extends object, TEvent exten
   let registeredResolvedCacheVersion = -1
   let registeredResolvedCache = new Map<string, readonly ResolvedCommandEntry<TTarget, TEvent>[] | null>()
 
-  const normalizeLayerCommands = (commands: readonly Command<TTarget, TEvent>[]): CommandState<TTarget, TEvent>[] => {
+  const normalizeLayerCommands = (
+    commands: readonly Command<TTarget, TEvent>[],
+    owned: boolean,
+  ): CommandState<TTarget, TEvent>[] => {
     return normalizeCommands({
       commands,
+      owned,
       commandFields: state.commandFields,
       conditions: conditions,
       onError: (code, error, message) => {
@@ -907,6 +913,35 @@ export function getCommand<TTarget extends object, TEvent extends KeymapEvent>(
   return state.command
 }
 
+// For `owned`, hands out a keymap-owned copy of a plain command whose methods call the latest registered
+// object, so a layer re-registered with fresh functions keeps the command objects that callers hold.
+// Other shapes (accessors, symbol or non-enumerable keys, class instances) are handed out as they are,
+// and a layer that holds one is always replaced.
+function ownCommand<TTarget extends object, TEvent extends KeymapEvent>(
+  state: CommandState<TTarget, TEvent>,
+  name: string,
+  owned: boolean,
+): Command<TTarget, TEvent> {
+  const source = state.source
+  if (!owned || !isPlainDataObject(source)) {
+    if (source.name !== name) source.name = name
+    return source
+  }
+
+  const own: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(source)) {
+    own[key] =
+      typeof value !== "function"
+        ? value
+        : function (this: unknown, ...args: unknown[]) {
+            const latest = state.source as Record<string, unknown>
+            return Reflect.apply(latest[key] as (...args: unknown[]) => unknown, this === own ? latest : this, args)
+          }
+  }
+  own.name = name
+  return own as unknown as Command<TTarget, TEvent>
+}
+
 function normalizeCommands<TTarget extends object, TEvent extends KeymapEvent>(
   options: NormalizeCommandsOptions<TTarget, TEvent>,
 ): CommandState<TTarget, TEvent>[] {
@@ -929,8 +964,6 @@ function normalizeCommands<TTarget extends object, TEvent extends KeymapEvent>(
         )
         continue
       }
-
-      command.name = normalizedName
 
       for (const [fieldName, value] of Object.entries(fields)) {
         if (value === undefined) {
@@ -956,13 +989,15 @@ function normalizeCommands<TTarget extends object, TEvent extends KeymapEvent>(
 
       const commandState: CommandState<TTarget, TEvent> = {
         command,
+        source: command,
         fields,
         attrs: Object.keys(attrs).length === 0 ? undefined : attrs,
         requires: Object.entries(mergedRequires),
         matchers,
       }
 
-      seen.add(commandState.command.name)
+      commandState.command = ownCommand(commandState, normalizedName, options.owned)
+      seen.add(normalizedName)
       normalizedCommands.push(commandState)
     } catch (error) {
       options.onError(

@@ -723,25 +723,36 @@ describe("keymap: commands and queries", () => {
   })
 
   test("replacing a layer costs state events, entries, and labels only when its content changes", () => {
-    const layerOf = (layer: number, commands: number, firstKey = "ctrl+a", tags: object = []) => ({
-      commands: Array.from({ length: commands }, (_, c) => ({ name: `l${layer}.c${c}`, tags, run() {} })),
-      bindings: Array.from({ length: commands }, (_, c) => ({
-        key: c === 0 ? firstKey : `ctrl+${"abcdefghij"[c]}`,
-        cmd: `l${layer}.c${c}`,
+    const layerOf = (layer: number, commands: number, change?: string) => ({
+      commands: Array.from({ length: commands + (change === "command added" ? 1 : 0) }, (_, c) => ({
+        name: `l${layer}.c${c}`,
+        tags: change === "array to object" ? {} : [],
+        run() {},
       })),
+      bindings: [
+        ...Array.from({ length: commands }, (_, c) => ({
+          key: c === 0 && change === "changed binding" ? "ctrl+shift+a" : `ctrl+${"abcdefghij"[c]}`,
+          cmd: `l${layer}.c${c}`,
+          ...(c === 0 && change === "binding field added" ? { desc: "d" } : {}),
+        })),
+        ...(change === "binding added" ? [{ key: "ctrl+z", cmd: `l${layer}.c0` }] : []),
+      ],
     })
-    // Layer 0, the oldest, is replaced. `work` is state events, entries built, and labels formatted;
-    // `order` lists the layers whose commands follow, newest first.
+    // Layer 0, the oldest, is replaced and keeps its position. `work` is state events, entries built, and
+    // labels formatted by a `state` listener.
     const rows = [
-      { change: "identical", layers: 3, commands: 4, work: [0, 0, 0], order: [2, 1, 0] },
-      { change: "identical", layers: 6, commands: 4, work: [0, 0, 0], order: [5, 4, 3, 2, 1, 0] },
-      { change: "fresh functions", layers: 3, commands: 4, work: [0, 0, 0], order: [2, 1, 0] },
-      { change: "fresh functions", layers: 3, commands: 8, work: [0, 0, 0], order: [2, 1, 0] },
-      { change: "changed binding", layers: 3, commands: 4, work: [1, 12, 12], order: [0, 2, 1] },
-      { change: "changed binding", layers: 6, commands: 4, work: [1, 24, 24], order: [0, 5, 4, 3, 2, 1] },
-      { change: "array to object", layers: 3, commands: 4, work: [1, 12, 12], order: [0, 2, 1] },
-      { change: "removed", layers: 3, commands: 4, work: [1, 8, 8], order: [2, 1] },
-      { change: "removed", layers: 3, commands: 8, work: [1, 16, 16], order: [2, 1] },
+      { change: "identical", layers: 3, commands: 4, work: [0, 0, 0] },
+      { change: "identical", layers: 6, commands: 4, work: [0, 0, 0] },
+      { change: "fresh functions", layers: 3, commands: 4, work: [0, 0, 0] },
+      { change: "fresh functions", layers: 3, commands: 8, work: [0, 0, 0] },
+      { change: "changed binding", layers: 3, commands: 4, work: [1, 12, 12] },
+      { change: "changed binding", layers: 6, commands: 4, work: [1, 24, 24] },
+      { change: "binding added", layers: 3, commands: 4, work: [1, 12, 13] },
+      { change: "command added", layers: 3, commands: 4, work: [1, 13, 12] },
+      { change: "binding field added", layers: 3, commands: 4, work: [1, 12, 12] },
+      { change: "array to object", layers: 3, commands: 4, work: [1, 12, 12] },
+      { change: "removed", layers: 3, commands: 4, work: [1, 8, 8] },
+      { change: "removed", layers: 3, commands: 8, work: [1, 16, 16] },
     ] as const
 
     for (const row of rows) {
@@ -761,59 +772,162 @@ describe("keymap: commands and queries", () => {
         }
       })
 
-      const next = {
-        identical: first,
-        "fresh functions": layerOf(0, row.commands),
-        "changed binding": layerOf(0, row.commands, "ctrl+shift+a"),
-        "array to object": layerOf(0, row.commands, "ctrl+a", {}),
-        removed: undefined,
-      }[row.change]
-      layers.replaceLayer(replaced, next)
+      const next = { identical: first, removed: undefined }[row.change as string]
+      layers.replaceLayer(
+        replaced,
+        row.change in { identical: 1, removed: 1 } ? next : layerOf(0, row.commands, row.change),
+      )
 
       expect({ change: row.change, work }).toEqual({ change: row.change, work: [...row.work] })
-      const names = row.order.flatMap((layer) => layerOf(layer, row.commands).commands.map((command) => command.name))
-      expect(keymap.getCommands().map((command) => command.name)).toEqual(names)
-      expect(getActiveKey(keymap, "b")?.command).toBe(`l${row.order[0]}.c1`)
+      const kept = Array.from({ length: row.layers }, (_, layer) => layer).filter(
+        (layer) => layer > 0 || row.change !== "removed",
+      )
+      const names = (order: number[]) => order.map((layer) => `l${layer}.c1`)
+      const reachable = keymap.getCommands().map((command) => command.name)
+      const registered = keymap.getCommands({ visibility: "registered" }).map((command) => command.name)
+      expect(reachable.filter((name) => name.endsWith(".c1"))).toEqual(names(kept.toReversed()))
+      expect(registered.filter((name) => name.endsWith(".c1"))).toEqual(names(kept))
+      expect(getActiveKey(keymap, "b")?.command).toBe(`l${row.layers - 1}.c1`)
     }
   })
 
-  test("a command object read before an identical replace calls the latest functions", () => {
+  test("a replace keeps the command objects callers hold and calls the latest functions", () => {
+    const calls: string[] = []
+    const command = (label: string, extra: object = {}) =>
+      Object.freeze({ name: "c", run: () => void calls.push(label), ...extra })
+    const getter = (label: string) => ({
+      name: "c",
+      get title() {
+        return "t"
+      },
+      run: () => void calls.push(label),
+    })
+    const hidden = (label: string) =>
+      Object.defineProperty({ name: "c" }, "run", { value: () => void calls.push(label) })
+    const throwing = (target: object, when: () => boolean) =>
+      new Proxy(target, {
+        ownKeys: (target) => {
+          if (when()) throw new Error("unreadable")
+          return Reflect.ownKeys(target)
+        },
+      })
+    const meta = { label: "a" }
+    const symbol = Symbol("field")
+    let armed = false
+    // [state events, calls of `runCommand` then of a `run` read before the replace, visible commands]. A kept
+    // layer's retained `run` forwards to the new one; a replaced layer's is the caller's old function.
+    const outcomes = {
+      kept: [0, ["new", "new"], 1],
+      "kept, now disabled": [1, ["new", "new"], 0],
+      replaced: [1, ["new", "old"], 1],
+      "replaced, now disabled": [1, ["new", "old"], 0],
+    }
+    const rows: [string, object, object, keyof typeof outcomes][] = [
+      ["fresh functions", command("old"), command("new"), "kept"],
+      ["proxy that ignores writes", new Proxy(command("old"), { set: () => true }), command("new"), "kept"],
+      ["proxy that throws once registered", throwing(command("old"), () => armed), command("new"), "kept"],
+      ["getter", getter("old"), getter("new"), "replaced"],
+      ["non-enumerable run", hidden("old"), hidden("new"), "replaced"],
+      ["symbol field", command("old", { [symbol]: 1 }), command("new", { [symbol]: 2 }), "replaced"],
+      ["nested data mutated", command("old", { meta }), command("new", { meta }), "replaced"],
+      ["nested proxy that throws", command("old", { meta: throwing({}, () => true) }), command("new"), "replaced"],
+      ["function to string", command("old", { label: () => "d" }), command("new", { label: "d" }), "replaced"],
+      ["enabled same result", command("old", { enabled: () => true }), command("new", { enabled: () => true }), "kept"],
+      [
+        "enabled flips",
+        command("old", { enabled: () => true }),
+        command("new", { enabled: () => false }),
+        "kept, now disabled",
+      ],
+      [
+        "enabled to boolean",
+        command("old", { enabled: () => true }),
+        command("new", { enabled: false }),
+        "replaced, now disabled",
+      ],
+    ]
+
+    for (const [change, first, next, outcome] of rows) {
+      const keymap = getKeymap(renderer)
+      const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
+      armed = false
+      const registered = layers.replaceLayer(undefined, { commands: [first as Command] })
+      const retained = keymap.getCommands({ visibility: "registered" })[0]!.run
+      armed = true
+      if (change === "nested data mutated") meta.label = "b"
+      let events = 0
+      keymap.on("state", () => void (events += 1))
+
+      layers.replaceLayer(registered, { commands: [next as Command] })
+      calls.length = 0
+      keymap.runCommand("c")
+      retained({} as never)
+      expect([change, events, calls, keymap.getCommands().length]).toEqual([change, ...outcomes[outcome]])
+    }
+  })
+
+  test("an identical replace keeps the layer's order and the latest inline handlers, also after a recompile", () => {
     const keymap = getKeymap(renderer)
     const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
     const calls: string[] = []
-    const layerOf = (version: string, enabled?: readonly [layer: boolean, command: boolean]) => ({
-      ...(enabled && { enabled: () => enabled[0] }),
-      commands: [
-        { name: "save", ...(enabled && { enabled: () => enabled[1] }), run: () => void calls.push(`run ${version}`) },
-      ],
-      bindings: [
-        { key: "x", cmd: "save" },
-        { key: "y", cmd: () => void calls.push(`cmd ${version}`) },
-      ],
+    const orders: number[][] = []
+    keymap.on("dispatch", (event) => {
+      if (event.layer && event.binding) orders.push([event.layer.order, event.binding.sourceLayerOrder])
     })
+    const layerOf = (version: string) => ({ bindings: [{ key: "y", cmd: () => void calls.push(version) }] })
 
-    let registered = layers.replaceLayer(undefined, layerOf("old"))
-    const command = keymap.getCommandEntries()[0]!.command
+    const registered = layers.replaceLayer(undefined, layerOf("old"))
+    layers.replaceLayer(undefined, { bindings: [{ key: "z", cmd: () => {} }] })
     getActiveKey(keymap, "y")
     expect(layers.replaceLayer(registered, layerOf("new"))).toBe(registered)
 
-    command.run({} as never)
-    mockInput.pressKey("x")
     mockInput.pressKey("y")
     ;(getActiveKey(keymap, "y")!.command as () => void)()
-    expect(calls).toEqual(["run new", "run new", "cmd new", "cmd new"])
-    expect(keymap.getCommandEntries()[0]!.command).toBe(command)
+    keymap.appendDisambiguationResolver(() => undefined)
+    mockInput.pressKey("y")
+    expect(calls).toEqual(["new", "new", "new"])
+    expect(orders).toEqual([
+      [0, 0],
+      [0, 0],
+    ])
+  })
 
-    // The first row replaces the layer (new fields); the next two keep it and swap in the latest matchers.
-    const visible = [
-      [true, false, 0],
-      [false, true, 0],
-      [true, true, 1],
-    ] as const
-    for (const [layer, command, count] of visible) {
-      registered = layers.replaceLayer(registered, layerOf("newer", [layer, command]))
-      expect(keymap.getCommands().length).toBe(count)
-    }
+  test("a failed reactive subscription is retried by the next replace", () => {
+    const keymap = getKeymap(renderer)
+    const { takeErrors } = captureDiagnostics(keymap)
+    const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
+    let attempts = 0
+    const layerOf = () => ({
+      enabled: {
+        get: () => true,
+        subscribe: () => {
+          attempts += 1
+          if (attempts === 1) throw new Error("not yet")
+          return () => {}
+        },
+      },
+      commands: [{ name: "c", run() {} }],
+    })
+
+    const registered = layers.replaceLayer(undefined, layerOf())
+    layers.replaceLayer(registered, layerOf())
+    expect(attempts).toBe(2)
+    expect(takeErrors().errors).toEqual(["not yet"])
+  })
+
+  test("a command object shared by two layers keeps each layer's own handler", () => {
+    const keymap = getKeymap(renderer)
+    const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
+    const calls: string[] = []
+    const shared = Object.freeze({ name: "c", run: () => void calls.push("shared") })
+
+    const replaced = layers.replaceLayer(undefined, { commands: [shared] })
+    layers.replaceLayer(undefined, { priority: -1, commands: [shared] })
+    layers.replaceLayer(replaced, { commands: [{ name: "c", run: () => void calls.push("fresh") }] })
+    keymap.runCommand("c")
+    layers.replaceLayer(replaced, undefined)
+    keymap.runCommand("c")
+    expect(calls).toEqual(["fresh", "shared"])
   })
 
   test("getCommands returns the registered command object across repeated reads", () => {

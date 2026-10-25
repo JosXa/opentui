@@ -96,7 +96,19 @@ See [Lifecycle and cleanup](/docs/core-concepts/lifecycle).
 The default dependency list is `[]`.
 
 Include every prop or state value that changes the returned layer. If reevaluation returns a different layer object,
-the hook disposes the old layer and registers the new one. An unrelated render keeps the existing layer.
+the hook replaces the registered layer with it. An unrelated render keeps the existing layer.
+
+The hook replaces its layer in one update, so `state` listeners see one change. The replaced layer keeps its
+position: among layers of the same priority, precedence follows mount order, and only a newly mounted layer goes
+on top. Earlier versions moved a re-registered layer to the top.
+
+If the new layer has the same data as the registered one and differs only in its functions, such as fresh `run`
+or `enabled` closures, the hook keeps the registered layer. Command objects read from the keymap earlier call the
+new functions, and a pending key sequence continues. `state` is emitted only if an `enabled` condition now gives a
+different result; other function results, such as a `title` function, are not compared. Plain commands
+registered this way are returned as keymap-owned copies, not as the objects passed in. A layer with a reactive
+matcher, or with a command that has getters, symbol or non-enumerable keys, or a class prototype, is always
+replaced.
 
 The layer can include Core fields such as `priority`, `bindings`, and `commands`.
 It can also include fields from installed addons, such as `enabled`.
@@ -110,7 +122,7 @@ React replaces the Core `target` field with `targetRef`:
 | Local exact focus | `targetRef`, `targetMode: "focus"` | Match only the exact focused renderable. |
 
 If `targetRef.current` is `null`, the hook waits. It checks the ref after each render and registers when the target
-appears. It also disposes and registers again if the same ref points to another renderable.
+appears. It also replaces the layer if the same ref points to another renderable.
 
 Passing `targetMode` without `targetRef` throws:
 

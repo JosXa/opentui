@@ -13,7 +13,7 @@ export interface KeymapExtensionContext<TTarget extends object, TEvent extends K
   conditions: ConditionService<TTarget, TEvent>
   catalog: CommandCatalogService<TTarget, TEvent>
   activation: ActivationService<TTarget, TEvent>
-  layers: LayerService<TTarget, TEvent>
+  layers: Pick<LayerService<TTarget, TEvent>, "replaceLayer">
 }
 
 export interface KeymapExtensionProvider<TTarget extends object, TEvent extends KeymapEvent> {

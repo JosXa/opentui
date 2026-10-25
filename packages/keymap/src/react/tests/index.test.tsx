@@ -190,6 +190,39 @@ describe("React keymap hooks", () => {
     expect(registerCalls).toBe(1)
   })
 
+  test("useBindings moves its layer when the provided keymap changes", async () => {
+    let first!: ReturnType<typeof useKeymap>
+    let second!: ReturnType<typeof useKeymap>
+    let setSecond!: Dispatch<SetStateAction<boolean>>
+
+    function Probe() {
+      useBindings(() => ({ commands: [{ name: "probe", run() {} }] }))
+      return <text>probe</text>
+    }
+
+    function App() {
+      first = useKeymap()
+      const [useSecond, setUseSecond] = useState(false)
+      setSecond = setUseSecond
+      return (
+        <KeymapProvider keymap={useSecond ? second : first}>
+          <Probe />
+        </KeymapProvider>
+      )
+    }
+
+    await act(async () => {
+      testSetup = await testRender(<App />, { width: 20, height: 6 })
+    })
+    second = diagnostics.trackKeymap(createDefaultOpenTuiKeymap(testSetup.renderer))
+    act(() => {
+      setSecond(true)
+    })
+
+    const names = (keymap: typeof first) => keymap.getCommands({ visibility: "registered" }).map(({ name }) => name)
+    expect([names(first), names(second)]).toEqual([[], ["probe"]])
+  })
+
   test("useBindings supports declarative release bindings", async () => {
     const calls: string[] = []
 
