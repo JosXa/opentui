@@ -25,7 +25,7 @@ import type { NotificationService } from "./notify.js"
 import { snapshotBindings, validateBindings } from "./primitives/bindings.js"
 import { createFieldCompilerContext } from "./primitives/field-invariants.js"
 import { buildSequenceTree } from "./sequence-index.js"
-import { getErrorMessage, snapshotDataValue } from "./values.js"
+import { getErrorMessage, sameIgnoringFunctions, snapshotDataValue } from "./values.js"
 
 const NOOP = (): void => {}
 
@@ -35,6 +35,15 @@ function compareLayers<TTarget extends object, TEvent extends KeymapEvent>(
 ): number {
   const priorityDiff = right.priority - left.priority
   return priorityDiff || right.order - left.order
+}
+
+// An attached reactive matcher has `dispose` set, so a layer with one never compares equal and is replaced.
+function comparableLayer<TTarget extends object, TEvent extends KeymapEvent>(
+  layer: RegisteredLayer<TTarget, TEvent>,
+): unknown[] {
+  const { target, targetMode, priority, requires, matchers, fields, attrs, commands, sourceBindings } = layer
+  const bindings = layer.bindings.map((binding) => ({ ...binding, sourceLayerOrder: 0 }))
+  return [target, targetMode, priority, requires, matchers, fields, attrs, commands, sourceBindings, bindings]
 }
 
 function layerBlocksActiveKeyCache<TTarget extends object, TEvent extends KeymapEvent>(
@@ -85,6 +94,10 @@ export interface LayerDiagnostics<TTarget extends object, TEvent extends KeymapE
 
 export interface LayerService<TTarget extends object, TEvent extends KeymapEvent> {
   registerLayer(layer: Layer<TTarget, TEvent>): () => void
+  replaceLayer(
+    previous: RegisteredLayer<TTarget, TEvent> | undefined,
+    layer: Layer<TTarget, TEvent> | undefined,
+  ): RegisteredLayer<TTarget, TEvent> | undefined
   applyTokenState(nextTokens: Map<string, ResolvedKeyToken>): void
   recompileBindings(): void
   cleanup(): void
@@ -98,100 +111,128 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
   options: LayersOptions<TTarget, TEvent>,
 ): LayerService<TTarget, TEvent> {
   const registerLayer = (layer: Layer<TTarget, TEvent>): (() => void) => {
+    const registeredLayer = replaceLayer(undefined, layer)
+    return registeredLayer ? () => unregisterLayer(registeredLayer) : NOOP
+  }
+
+  // Replaces `previous` in one state batch. A layer that differs from `previous` only in its
+  // functions keeps the old position and objects, which now call the latest functions.
+  const replaceLayer = (
+    previous: RegisteredLayer<TTarget, TEvent> | undefined,
+    layer: Layer<TTarget, TEvent> | undefined,
+  ): RegisteredLayer<TTarget, TEvent> | undefined => {
     return notify.runWithStateChangeBatch(() => {
-      const target = layer.target
-      if (target && options.host.isTargetDestroyed(target)) {
-        notify.emitError(
-          "destroyed-layer-target",
-          { target },
-          "Cannot register a keymap layer for a destroyed keymap target",
-        )
-        return NOOP
+      const next = layer && compileLayer(layer)
+      // `previous` is still registered: only a destroyed target removes it, and such a layer fails to compile.
+      if (previous && next && sameIgnoringFunctions(comparableLayer(previous), comparableLayer(next))) {
+        refreshLayer(previous, next)
+        return previous
       }
 
-      let sourceBindings: Binding<TTarget, TEvent>[]
-      let requires: readonly [name: string, value: unknown][]
-      let matchers: readonly RuntimeMatcher[]
-      let fields: Readonly<Record<string, unknown>> | undefined
-      let attrs: Readonly<Attributes> | undefined
-      let commands: readonly CommandState<TTarget, TEvent>[]
-      let targetMode: TargetMode | undefined
-
-      try {
-        targetMode = normalizeTargetMode(layer)
-        sourceBindings = applyLayerBindingsTransformers(snapshotBindings(layer.bindings ?? []), layer)
-        const sourceCommands = applyCommandTransformers(layer.commands ?? [], layer)
-        commands = sourceCommands.length === 0 ? [] : options.commands.normalizeCommands(sourceCommands)
-        ;({ requires, matchers, fields, attrs } = compileLayerRuntimeState(layer))
-      } catch (error) {
-        notify.emitError("register-layer-failed", error, getErrorMessage(error, "Failed to register keymap layer"))
-        return NOOP
-      }
-
-      const order = state.order++
-      const bindingStates = options.compiler.compileBindings(sourceBindings, state.tokens, target, order, fields)
-
-      if (bindingStates.bindings.length === 0 && !bindingStates.hasTokenBindings && commands.length === 0) {
-        return NOOP
-      }
-
-      options.diagnostics?.analyzeLayer({
-        target,
-        order,
-        commands,
-        sourceBindings,
-        bindings: bindingStates.bindings,
-        hasTokenBindings: bindingStates.hasTokenBindings,
-      })
-
-      const registeredLayer: RegisteredLayer<TTarget, TEvent> = {
-        order,
-        target,
-        targetMode,
-        priority: layer.priority ?? 0,
-        requires,
-        matchers,
-        fields,
-        attrs,
-        commands,
-        sourceBindings,
-        bindings: bindingStates.bindings,
-        root: buildSequenceTree(bindingStates.bindings, state.patterns),
-        hasTokenBindings: bindingStates.hasTokenBindings,
-        activeKeyCacheBlocked: false,
-        activeCommandViewCacheBlocked: false,
-      }
-
-      updateCacheBlockers(registeredLayer)
-
-      state.layers.add(registeredLayer)
-      state.sortedLayers = [...state.sortedLayers, registeredLayer].sort(compareLayers)
-      attachReactiveMatchers(registeredLayer)
-      for (const command of registeredLayer.commands) {
-        attachReactiveMatchers(command)
-      }
-      for (const binding of registeredLayer.bindings) {
-        attachReactiveMatchers(binding)
-      }
-
-      if (target) {
-        const onTargetDestroy = () => {
-          unregisterLayer(registeredLayer)
-        }
-
-        registeredLayer.offTargetDestroy = options.host.onTargetDestroy(target, onTargetDestroy)
-      }
-
-      if (registeredLayer.commands.length > 0) {
-        activation.ensureValidPendingSequence()
-      }
-
-      notify.queueStateChange()
-
-      return () => {
-        unregisterLayer(registeredLayer)
-      }
+      if (previous) unregisterLayer(previous)
+      if (next) addLayer(next)
+      return next
     })
+  }
+
+  const compileLayer = (layer: Layer<TTarget, TEvent>): RegisteredLayer<TTarget, TEvent> | undefined => {
+    const target = layer.target
+    if (target && options.host.isTargetDestroyed(target)) {
+      notify.emitError(
+        "destroyed-layer-target",
+        { target },
+        "Cannot register a keymap layer for a destroyed keymap target",
+      )
+      return undefined
+    }
+
+    let sourceBindings: Binding<TTarget, TEvent>[]
+    let requires: readonly [name: string, value: unknown][]
+    let matchers: readonly RuntimeMatcher[]
+    let fields: Readonly<Record<string, unknown>> | undefined
+    let attrs: Readonly<Attributes> | undefined
+    let commands: readonly CommandState<TTarget, TEvent>[]
+    let targetMode: TargetMode | undefined
+
+    try {
+      targetMode = normalizeTargetMode(layer)
+      sourceBindings = applyLayerBindingsTransformers(snapshotBindings(layer.bindings ?? []), layer)
+      const sourceCommands = applyCommandTransformers(layer.commands ?? [], layer)
+      commands = sourceCommands.length === 0 ? [] : options.commands.normalizeCommands(sourceCommands)
+      ;({ requires, matchers, fields, attrs } = compileLayerRuntimeState(layer))
+    } catch (error) {
+      notify.emitError("register-layer-failed", error, getErrorMessage(error, "Failed to register keymap layer"))
+      return undefined
+    }
+
+    const order = state.order++
+    const bindingStates = options.compiler.compileBindings(sourceBindings, state.tokens, target, order, fields)
+
+    if (bindingStates.bindings.length === 0 && !bindingStates.hasTokenBindings && commands.length === 0) {
+      return undefined
+    }
+
+    return {
+      order,
+      target,
+      targetMode,
+      priority: layer.priority ?? 0,
+      requires,
+      matchers,
+      fields,
+      attrs,
+      commands,
+      sourceBindings,
+      bindings: bindingStates.bindings,
+      root: buildSequenceTree(bindingStates.bindings, state.patterns),
+      hasTokenBindings: bindingStates.hasTokenBindings,
+      activeKeyCacheBlocked: false,
+      activeCommandViewCacheBlocked: false,
+    }
+  }
+
+  const addLayer = (registeredLayer: RegisteredLayer<TTarget, TEvent>): void => {
+    options.diagnostics?.analyzeLayer(registeredLayer)
+    updateCacheBlockers(registeredLayer)
+
+    state.layers.add(registeredLayer)
+    state.sortedLayers = [...state.sortedLayers, registeredLayer].sort(compareLayers)
+    attachReactiveMatchers(registeredLayer)
+    for (const command of registeredLayer.commands) {
+      attachReactiveMatchers(command)
+    }
+    for (const binding of registeredLayer.bindings) {
+      attachReactiveMatchers(binding)
+    }
+
+    const target = registeredLayer.target
+    if (target) {
+      registeredLayer.offTargetDestroy = options.host.onTargetDestroy(target, () => {
+        unregisterLayer(registeredLayer)
+      })
+    }
+
+    if (registeredLayer.commands.length > 0) {
+      activation.ensureValidPendingSequence()
+    }
+
+    notify.queueStateChange()
+  }
+
+  // Moves the latest functions into the objects that callers and caches already hold.
+  const refreshLayer = (previous: RegisteredLayer<TTarget, TEvent>, next: RegisteredLayer<TTarget, TEvent>): void => {
+    previous.commands.forEach((commandState, index) => {
+      const nextState = next.commands[index]!
+      Object.assign(commandState, nextState, { command: Object.assign(commandState.command, nextState.command) })
+    })
+    previous.bindings.forEach((binding, index) => {
+      Object.assign(binding, next.bindings[index], { sourceLayerOrder: binding.sourceLayerOrder })
+    })
+    const { requires, matchers, fields, attrs, sourceBindings } = next
+    Object.assign(previous, { requires, matchers, fields, attrs, sourceBindings })
+    // Snapshots such as active keys copy binding functions; drop them without a state event.
+    state.derivedVersion += 1
+    state.cacheVersion += 1
   }
 
   const applyTokenState = (nextTokens: Map<string, ResolvedKeyToken>): void => {
@@ -531,5 +572,5 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
     }
   }
 
-  return { registerLayer, applyTokenState, recompileBindings, cleanup }
+  return { registerLayer, replaceLayer, applyTokenState, recompileBindings, cleanup }
 }

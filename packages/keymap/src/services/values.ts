@@ -3,6 +3,27 @@ function isPlainObject(value: object): boolean {
   return prototype === Object.prototype || prototype === null
 }
 
+// Bounds the walk; deeper or cyclic data compares unequal, which only costs a full replace.
+const SAME_DEPTH_MAX = 16
+
+// Compares arrays and plain objects by content, any two functions as equal, and everything else by identity.
+export function sameIgnoringFunctions(left: unknown, right: unknown, depth = 0): boolean {
+  if (Object.is(left, right)) return true
+  if (typeof left === "function") return typeof right === "function"
+  if (depth >= SAME_DEPTH_MAX || !isComparable(left) || !isComparable(right)) return false
+  if (Array.isArray(left) !== Array.isArray(right)) return false
+
+  const keys = Object.keys(left)
+  return (
+    keys.length === Object.keys(right).length &&
+    keys.every((key) => Object.hasOwn(right, key) && sameIgnoringFunctions(left[key], right[key], depth + 1))
+  )
+}
+
+function isComparable(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && (Array.isArray(value) || isPlainObject(value))
+}
+
 export function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message) {
     return error.message

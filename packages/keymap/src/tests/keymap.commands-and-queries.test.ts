@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { BoxRenderable, KeyEvent, type Renderable } from "@opentui/core"
 import { createTestRenderer, type MockInput, type TestRenderer } from "@opentui/core/testing"
 import * as addons from "../addons/index.js"
+import { formatCommandBindings } from "../extras/index.js"
 import {
+  KEYMAP_EXTENSION_CONTEXT,
   stringifyKeySequence,
   stringifyKeyStroke,
   type ActiveKey,
@@ -718,6 +720,100 @@ describe("keymap: commands and queries", () => {
     expect(keymap.runCommand("retry-command")).toEqual({ ok: true })
     expect(calls).toEqual(["registered"])
     expect(takeErrors().errors).toEqual(["broken command field"])
+  })
+
+  test("replacing a layer costs state events, entries, and labels only when its content changes", () => {
+    const layerOf = (layer: number, commands: number, firstKey = "ctrl+a", tags: object = []) => ({
+      commands: Array.from({ length: commands }, (_, c) => ({ name: `l${layer}.c${c}`, tags, run() {} })),
+      bindings: Array.from({ length: commands }, (_, c) => ({
+        key: c === 0 ? firstKey : `ctrl+${"abcdefghij"[c]}`,
+        cmd: `l${layer}.c${c}`,
+      })),
+    })
+    // Layer 0, the oldest, is replaced. `work` is state events, entries built, and labels formatted;
+    // `order` lists the layers whose commands follow, newest first.
+    const rows = [
+      { change: "identical", layers: 3, commands: 4, work: [0, 0, 0], order: [2, 1, 0] },
+      { change: "identical", layers: 6, commands: 4, work: [0, 0, 0], order: [5, 4, 3, 2, 1, 0] },
+      { change: "fresh functions", layers: 3, commands: 4, work: [0, 0, 0], order: [2, 1, 0] },
+      { change: "fresh functions", layers: 3, commands: 8, work: [0, 0, 0], order: [2, 1, 0] },
+      { change: "changed binding", layers: 3, commands: 4, work: [1, 12, 12], order: [0, 2, 1] },
+      { change: "changed binding", layers: 6, commands: 4, work: [1, 24, 24], order: [0, 5, 4, 3, 2, 1] },
+      { change: "array to object", layers: 3, commands: 4, work: [1, 12, 12], order: [0, 2, 1] },
+      { change: "removed", layers: 3, commands: 4, work: [1, 8, 8], order: [2, 1] },
+      { change: "removed", layers: 3, commands: 8, work: [1, 16, 16], order: [2, 1] },
+    ] as const
+
+    for (const row of rows) {
+      const keymap = getKeymap(renderer)
+      const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
+      const first = layerOf(0, row.commands)
+      const replaced = layers.replaceLayer(undefined, first)
+      for (let layer = 1; layer < row.layers; layer += 1) layers.replaceLayer(undefined, layerOf(layer, row.commands))
+
+      const work = [0, 0, 0]
+      const countLabels = new Proxy({}, { get: () => void (work[2]! += 1) })
+      keymap.on("state", () => {
+        work[0]! += 1
+        for (const entry of keymap.getCommandEntries()) {
+          work[1]! += 1
+          formatCommandBindings(entry.bindings, { keyNameAliases: countLabels })
+        }
+      })
+
+      const next = {
+        identical: first,
+        "fresh functions": layerOf(0, row.commands),
+        "changed binding": layerOf(0, row.commands, "ctrl+shift+a"),
+        "array to object": layerOf(0, row.commands, "ctrl+a", {}),
+        removed: undefined,
+      }[row.change]
+      layers.replaceLayer(replaced, next)
+
+      expect({ change: row.change, work }).toEqual({ change: row.change, work: [...row.work] })
+      const names = row.order.flatMap((layer) => layerOf(layer, row.commands).commands.map((command) => command.name))
+      expect(keymap.getCommands().map((command) => command.name)).toEqual(names)
+      expect(getActiveKey(keymap, "b")?.command).toBe(`l${row.order[0]}.c1`)
+    }
+  })
+
+  test("a command object read before an identical replace calls the latest functions", () => {
+    const keymap = getKeymap(renderer)
+    const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
+    const calls: string[] = []
+    const layerOf = (version: string, enabled?: readonly [layer: boolean, command: boolean]) => ({
+      ...(enabled && { enabled: () => enabled[0] }),
+      commands: [
+        { name: "save", ...(enabled && { enabled: () => enabled[1] }), run: () => void calls.push(`run ${version}`) },
+      ],
+      bindings: [
+        { key: "x", cmd: "save" },
+        { key: "y", cmd: () => void calls.push(`cmd ${version}`) },
+      ],
+    })
+
+    let registered = layers.replaceLayer(undefined, layerOf("old"))
+    const command = keymap.getCommandEntries()[0]!.command
+    getActiveKey(keymap, "y")
+    expect(layers.replaceLayer(registered, layerOf("new"))).toBe(registered)
+
+    command.run({} as never)
+    mockInput.pressKey("x")
+    mockInput.pressKey("y")
+    ;(getActiveKey(keymap, "y")!.command as () => void)()
+    expect(calls).toEqual(["run new", "run new", "cmd new", "cmd new"])
+    expect(keymap.getCommandEntries()[0]!.command).toBe(command)
+
+    // The first row replaces the layer (new fields); the next two keep it and swap in the latest matchers.
+    const visible = [
+      [true, false, 0],
+      [false, true, 0],
+      [true, true, 1],
+    ] as const
+    for (const [layer, command, count] of visible) {
+      registered = layers.replaceLayer(registered, layerOf("newer", [layer, command]))
+      expect(keymap.getCommands().length).toBe(count)
+    }
   })
 
   test("getCommands returns the registered command object across repeated reads", () => {

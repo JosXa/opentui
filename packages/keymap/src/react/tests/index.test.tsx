@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import type { Renderable } from "@opentui/core"
 import { createTestRenderer, type TestRendererOptions } from "@opentui/core/testing"
-import { stringifyKeySequence } from "@opentui/keymap"
+import { KEYMAP_EXTENSION_CONTEXT, stringifyKeySequence } from "@opentui/keymap"
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import {
   KeymapProvider,
@@ -159,14 +159,15 @@ describe("React keymap hooks", () => {
       }, [manager])
 
       useEffect(() => {
-        const original = manager.registerLayer.bind(manager)
-        manager.registerLayer = ((layer) => {
+        const layers = manager[KEYMAP_EXTENSION_CONTEXT]().layers
+        const original = layers.replaceLayer
+        layers.replaceLayer = (previous, layer) => {
           registerCalls += 1
-          return original(layer)
-        }) as typeof manager.registerLayer
+          return original(previous, layer)
+        }
 
         return () => {
-          manager.registerLayer = original
+          layers.replaceLayer = original
         }
       }, [manager])
 

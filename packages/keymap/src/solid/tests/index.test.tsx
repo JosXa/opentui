@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import type { Renderable } from "@opentui/core"
 import { createTestRenderer, type TestRendererOptions } from "@opentui/core/testing"
 import * as addons from "@opentui/keymap/addons"
-import { stringifyKeySequence } from "@opentui/keymap"
+import { KEYMAP_EXTENSION_CONTEXT, stringifyKeySequence } from "@opentui/keymap"
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import {
   KeymapProvider,
@@ -127,18 +127,19 @@ describe("solid keymap hooks", () => {
       setTick = setTickSignal
 
       const offCommands = manager.registerLayer({ commands: [{ name: "probe", run() {} }] })
-      const original = manager.registerLayer.bind(manager)
-      manager.registerLayer = ((layer) => {
+      const layers = manager[KEYMAP_EXTENSION_CONTEXT]().layers
+      const original = layers.replaceLayer
+      layers.replaceLayer = (previous, layer) => {
         registerCalls += 1
-        return original(layer)
-      }) as typeof manager.registerLayer
+        return original(previous, layer)
+      }
 
       useBindings(() => ({
         bindings: [{ key: "x", cmd: "probe" }],
       }))
 
       onCleanup(() => {
-        manager.registerLayer = original
+        layers.replaceLayer = original
         offCommands()
       })
 
@@ -153,6 +154,41 @@ describe("solid keymap hooks", () => {
     await Bun.sleep(0)
 
     expect(registerCalls).toBe(1)
+  })
+
+  test("useBindings updates that leave layers unchanged do not rerun keymap selectors", async () => {
+    const [tick, setTick] = createSignal(0)
+    const [key, setKey] = createSignal("x")
+    let selectorRuns = 0
+
+    function App() {
+      for (const name of ["first", "second", "third"]) {
+        useBindings(() => {
+          tick()
+          return { commands: [{ name, run() {} }], bindings: [{ key: name === "first" ? key() : "y", cmd: name }] }
+        })
+      }
+
+      const entries = useKeymapSelector((keymap) => {
+        selectorRuns += 1
+        return keymap.getCommandEntries()
+      })
+
+      return <text>{`${entries().length}`}</text>
+    }
+
+    testSetup = await testRender(() => <App />, { width: 20, height: 6 })
+    const runs = [selectorRuns]
+
+    setTick(1)
+    await Bun.sleep(0)
+    runs.push(selectorRuns)
+
+    setKey("z")
+    await Bun.sleep(0)
+    runs.push(selectorRuns)
+
+    expect(runs.map((count) => count - runs[0]!)).toEqual([0, 0, 1])
   })
 
   test("useBindings supports declarative release bindings", async () => {
