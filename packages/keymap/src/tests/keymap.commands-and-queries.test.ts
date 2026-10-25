@@ -1320,6 +1320,7 @@ describe("keymap: commands and queries", () => {
 
   test("compiled values the API exposes compare by identity, whatever the compile read", () => {
     const requirement = { id: 1 }
+    const gate = () => true
     const fresh = () => ({ id: 1 })
     const rows: [
       string,
@@ -1361,6 +1362,16 @@ describe("keymap: commands and queries", () => {
           keymap.appendCommandTransformer((command) => void (command.meta = compiles++ === 0 ? requirement : fresh())),
         () => ({ commands: [{ name: "c", run() {} }] }),
         (keymap) => keymap.getCommands({ filter: { meta: requirement } }).length,
+      ],
+      [
+        // A requirement compares data by identity; a fresh function is a different requirement.
+        "requirement from a fresh function",
+        (keymap) => {
+          keymap.registerCommandFields({ gate: (value, ctx) => ctx.require("gate", value) })
+          keymap.setData("gate", gate)
+        },
+        (_label, compile) => ({ commands: [{ name: "c", gate: compile === 0 ? gate : () => true, run() {} }] }),
+        (keymap) => keymap.dispatchCommand("c").ok,
       ],
       [
         "layer requirement from a field compiler",
@@ -1447,7 +1458,17 @@ describe("keymap: commands and queries", () => {
       })
       keymap.registerBindingFields({ hint: (_value, ctx) => ctx.attr("hint", hook("hint")) })
       keymap.setData("audience", pool.audience)
+      // A function requirement matches only the pooled function, so a fresh one disables its target.
+      const requireGate = (value: unknown, ctx: { require(name: string, value: unknown): void }) =>
+        ctx.require("gate", value)
+      keymap.registerLayerFields({ gate: requireGate })
+      keymap.registerCommandFields({ gate: requireGate })
+      keymap.registerBindingFields({ gate: requireGate })
+      keymap.setData("gate", gate)
     }
+    const gate = () => true
+    type Gate = "pooled" | "fresh" | undefined
+    const gateOf = (kind: Gate) => (kind === "fresh" ? { gate: () => true } : kind ? { gate } : {})
     type Spec = {
       title: string
       meta?: "pooled" | "fresh"
@@ -1456,12 +1477,15 @@ describe("keymap: commands and queries", () => {
       key?: string
       hint?: number
       enabled?: boolean
+      gate?: Gate
+      bindingGate?: Gate
     }
     const object = (key: Key, kind?: "pooled" | "fresh") => (kind === "fresh" ? { ...pool[key] } : kind && pool[key])
     // A layer `enabled` function is a fresh closure on every build.
-    const layerOf = (specs: readonly Spec[], section: boolean, label: string, enabled = false) => ({
+    const layerOf = (specs: readonly Spec[], section: boolean, label: string, enabled = false, layerGate?: Gate) => ({
       ...(section ? { section: 1 } : {}),
       ...(enabled ? { enabled: () => true } : {}),
+      ...gateOf(layerGate),
       commands: specs.map((spec, index) => ({
         name: `c${index}`,
         title: spec.title,
@@ -1469,10 +1493,20 @@ describe("keymap: commands and queries", () => {
         ...(spec.audience ? { audience: object("audience", spec.audience) } : {}),
         ...(spec.note ? { note: spec.note } : {}),
         ...(spec.enabled === undefined ? {} : { enabled: () => spec.enabled }),
+        ...gateOf(spec.gate),
         run: () => void calls.push(`${label}:c${index}`),
       })),
       bindings: specs.flatMap((spec, index) =>
-        spec.key ? [{ key: spec.key, cmd: `c${index}`, ...(spec.hint ? { hint: spec.hint } : {}) }] : [],
+        spec.key
+          ? [
+              {
+                key: spec.key,
+                cmd: `c${index}`,
+                ...(spec.hint ? { hint: spec.hint } : {}),
+                ...gateOf(spec.bindingGate),
+              },
+            ]
+          : [],
       ),
     })
     const randomSpec = (): Spec => ({
@@ -1483,9 +1517,26 @@ describe("keymap: commands and queries", () => {
       key: pick([undefined, "x", "y"]),
       hint: pick([undefined, 1]),
       enabled: pick([undefined, true, false]),
+      gate: pick([undefined, "pooled", "pooled", "fresh"] as const),
+      bindingGate: pick([undefined, "pooled", "pooled", "fresh"] as const),
     })
     const vary = (spec: Spec): Spec => {
-      const change = pick(["same", "same", "same", "same", "same", "title", "meta", "audience", "enabled"] as const)
+      const change = pick([
+        "same",
+        "same",
+        "same",
+        "same",
+        "same",
+        "title",
+        "meta",
+        "audience",
+        "enabled",
+        "gate",
+        "bindingGate",
+      ] as const)
+      // Condition functions are fresh closures on every build; these changes flip their results.
+      if (change === "gate") return { ...spec, gate: spec.gate === "fresh" ? "pooled" : "fresh" }
+      if (change === "bindingGate") return { ...spec, bindingGate: spec.bindingGate === "fresh" ? "pooled" : "fresh" }
       if (change === "title") return { ...spec, title: spec.title === "a" ? "b" : "a" }
       if (change === "meta") return { ...spec, meta: pick(["pooled", "fresh"] as const) }
       if (change === "audience") return { ...spec, audience: pick(["pooled", "fresh"] as const) }
@@ -1524,14 +1575,17 @@ describe("keymap: commands and queries", () => {
         .getCommands({ visibility: "registered" })
         .map(({ name, title, meta, audience, note }) => [name, title, meta, audience, note])
       const names = commands.map(([name]) => name as string)
-      for (const name of names) keymap.dispatchCommand(name)
+      const dispatched = names.map((name) => keymap.dispatchCommand(name))
       const ran = calls.map((call) => call.replace(`${label}:`, ""))
+      const reachable = keymap.getCommands().map(({ name }) => name)
       const bindings = [...keymap.getCommandBindings({ visibility: "registered", commands: names }).entries()]
       const keys = keymap
         .getActiveKeys({ includeMetadata: true })
         .map(({ display, command, bindingAttrs, commandAttrs }) => [display, command, bindingAttrs, commandAttrs])
       return JSON.stringify({
         commands,
+        dispatched,
+        reachable,
         ran,
         keys,
         bindings: bindings.map(([name, list]) => [name, list.map(({ attrs, commandAttrs }) => [attrs, commandAttrs])]),
@@ -1540,10 +1594,12 @@ describe("keymap: commands and queries", () => {
 
     const failures: string[] = []
     let kept = 0
-    for (let trial = 0; trial < 300; trial += 1) {
+    for (let trial = 0; trial < 500; trial += 1) {
       const specs = Array.from({ length: 1 + Math.floor(random() * 3) }, randomSpec)
       const section = random() < 0.5
       const layerEnabled = random() < 0.1
+      const layerGate = pick([undefined, "pooled", "fresh"] as const)
+      const nextLayerGate = layerGate && random() < 0.3 ? (layerGate === "fresh" ? "pooled" : "fresh") : layerGate
       const nextSpecs = specs.map(vary)
       const tip = getKeymap(renderer)
       const main = getKeymap(renderer)
@@ -1551,16 +1607,16 @@ describe("keymap: commands and queries", () => {
       install(main)
       freshHooks = false
       const { layers } = tip[KEYMAP_EXTENSION_CONTEXT]()
-      const registered = layers.replaceLayer(undefined, layerOf(specs, section, "first", layerEnabled))
+      const registered = layers.replaceLayer(undefined, layerOf(specs, section, "first", layerEnabled, layerGate))
       const [first, second] = [read(tip), read(tip)]
       const before = content(tip, "first")
       let events = 0
       tip.on("state", () => void (events += 1))
 
       freshHooks = random() < 0.2
-      layers.replaceLayer(registered, layerOf(nextSpecs, section, "next", layerEnabled))
+      layers.replaceLayer(registered, layerOf(nextSpecs, section, "next", layerEnabled, nextLayerGate))
       const after = content(tip, "next")
-      main.registerLayer(layerOf(nextSpecs, section, "next", layerEnabled))
+      main.registerLayer(layerOf(nextSpecs, section, "next", layerEnabled, nextLayerGate))
       const expected = content(main, "next")
 
       if (after !== expected) failures.push(`${trial}: results differ from main`)
@@ -1573,8 +1629,31 @@ describe("keymap: commands and queries", () => {
         }
       }
     }
-    // About 40 of the 300 trials take the fast path.
-    expect([failures.slice(0, 5), kept >= 25]).toEqual([[], true])
+    // About 37 of the 500 trials take the fast path without an event.
+    expect([failures.slice(0, 5), kept >= 30]).toEqual([[], true])
+  })
+
+  test("a kept layer whose binding condition turns false clears a pending sequence through it, as on main", () => {
+    const keymap = getKeymap(renderer)
+    const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
+    const gate = () => true
+    keymap.registerBindingFields({ gate: (value, ctx) => ctx.require("gate", value) })
+    keymap.setData("gate", gate)
+    const layerOf = (value: () => boolean) => ({
+      commands: [{ name: "c", run() {} }],
+      bindings: [{ key: "g g", cmd: "c", gate: value }],
+    })
+
+    const registered = layers.replaceLayer(undefined, layerOf(gate))
+    mockInput.pressKey("g")
+    const pending = keymap.getPendingSequence().length
+    expect(
+      layers.replaceLayer(
+        registered,
+        layerOf(() => true),
+      ),
+    ).toBe(registered)
+    expect([pending, keymap.getPendingSequence().length]).toEqual([1, 0])
   })
 
   test("a failed reactive subscription is retried by the next replace", () => {

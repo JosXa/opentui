@@ -53,6 +53,10 @@ function compiledData<TTarget extends object, TEvent extends KeymapEvent>(layer:
   return compiled
 }
 
+function hasConditions(target: RuntimeMatchable): boolean {
+  return target.requires.length > 0 || target.matchers.length > 0
+}
+
 function conditionTargets<TTarget extends object, TEvent extends KeymapEvent>(
   layer: RegisteredLayer<TTarget, TEvent>,
 ): RuntimeMatchable[] {
@@ -123,10 +127,11 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
   activation: ActivationService<TTarget, TEvent>,
   options: LayersOptions<TTarget, TEvent>,
 ): LayerService<TTarget, TEvent> {
-  // Layers that `replaceLayer` registered from plain data, and the last result of each of their `enabled`
-  // conditions that `state` listeners have seen (at registration or at the last event).
+  // Layers that `replaceLayer` registered from plain data, and the last condition result (requirements and
+  // matchers together) of each of their layer, commands and bindings that `state` listeners have seen, at
+  // registration or at the last event.
   const plainLayers = new WeakSet<RegisteredLayer<TTarget, TEvent>>()
-  const seenEnabled = new WeakMap<RuntimeMatchable, boolean>()
+  const seenConditions = new WeakMap<RuntimeMatchable, boolean>()
   // Gives function binding commands a forwarder, so snapshots that copy them (active keys) stay current.
   const forwardBindingCommands = (bindings: readonly BindingState<TTarget, TEvent>[]): void => {
     for (const binding of bindings) {
@@ -136,14 +141,14 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
     }
   }
 
-  const recordEnabled = (layer: RegisteredLayer<TTarget, TEvent>): void => {
+  const recordConditions = (layer: RegisteredLayer<TTarget, TEvent>): void => {
     for (const target of conditionTargets(layer)) {
-      if (target.matchers.length > 0) seenEnabled.set(target, conditions.matchesConditions(target))
+      if (hasConditions(target)) seenConditions.set(target, conditions.matchesConditions(target))
     }
   }
 
   notify.onStateEvent(() => {
-    for (const layer of state.layers) if (plainLayers.has(layer)) recordEnabled(layer)
+    for (const layer of state.layers) if (plainLayers.has(layer)) recordConditions(layer)
   })
 
   const registerLayer = (layer: Layer<TTarget, TEvent>): (() => void) => {
@@ -157,8 +162,8 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
 
   // Replaces `previous` in one state batch, in its position: precedence follows mount order. A plain-data
   // layer that compiles to data equal to `previous` (see `keptMoves`) keeps `previous` whole, so nothing the
-  // API hands out changes; only its functions move to the new ones, and `state` fires only if an `enabled`
-  // result differs from the one listeners have seen. Anything else takes the full replace. The decision uses
+  // API hands out changes; only its functions move to the new ones, and `state` fires only if a condition
+  // result (requirements and matchers) differs from the one listeners have seen. Anything else takes the full replace. The decision uses
   // the compiled layer, so what it compares is what queries and dispatch use.
   const replaceLayer = (
     previous: RegisteredLayer<TTarget, TEvent> | undefined,
@@ -185,7 +190,7 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
       addLayer(next)
       if (plain) {
         plainLayers.add(next)
-        recordEnabled(next)
+        recordConditions(next)
       }
       if (position >= 0) {
         // `state.layers` keeps registration order, which the "registered" command view reports.
@@ -311,14 +316,16 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
     next: RegisteredLayer<TTarget, TEvent>,
     moves: readonly [object, string, unknown][],
   ): void => {
+    // Any moved function can feed a condition (a matcher, a requirement value), so every condition is evaluated
+    // once with the new functions; a result that differs from the last one listeners saw is a state change.
     const nextTargets = conditionTargets(next)
     let changed = false
     conditionTargets(previous).forEach((target, index) => {
       const fresh = nextTargets[index]!
-      if (fresh.matchers.length === 0) return
-      const enabled = conditions.matchesConditions(fresh)
-      changed ||= seenEnabled.get(target) !== enabled
-      seenEnabled.set(target, enabled)
+      if (!hasConditions(fresh)) return
+      const result = conditions.matchesConditions(fresh)
+      changed ||= seenConditions.get(target) !== result
+      seenConditions.set(target, result)
     })
 
     for (const [container, key, value] of moves) (container as Record<string, unknown>)[key] = value
