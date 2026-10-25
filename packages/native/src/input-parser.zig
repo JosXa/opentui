@@ -5,6 +5,8 @@
 const std = @import("std");
 
 pub const timeout_ns: u64 = 20 * std.time.ns_per_ms;
+/// How long an awaited OSC, DCS, or APC reply, split by a slow link, or its discarded overflow waits for a byte.
+pub const reply_timeout_ns: u64 = 5 * std.time.ns_per_s;
 pub const unit_bytes_max: u16 = 4096;
 pub const sequence_bytes_max: u16 = 256;
 pub const key_text_bytes_max: u8 = 32;
@@ -250,12 +252,14 @@ pub const InputParser = struct {
 
     /// When the host should call feed with zero bytes, or null.
     pub fn deadlineNs(self: *const InputParser) ?u64 {
-        const waits = switch (self.state) {
-            .ground, .expired, .paste => false,
-            .csi => |csi| !csi.deferred or !self.deferrable(),
-            else => true,
+        const timeout: u64 = switch (self.state) {
+            .ground, .expired, .paste => return null,
+            .csi => |csi| if (csi.deferred and self.deferrable()) return null else timeout_ns,
+            .string => if (self.expect.replies) reply_timeout_ns else timeout_ns,
+            .discard => |discard| if (discard.string and self.expect.replies) reply_timeout_ns else timeout_ns,
+            else => timeout_ns,
         };
-        return if (waits) self.since_ns +| timeout_ns else null;
+        return self.since_ns +| timeout;
     }
 
     /// Changes expectations without emitting; the next feed re-evaluates a deferred unit.
@@ -335,7 +339,7 @@ pub const InputParser = struct {
                 self.state = .ground;
                 emitReply(sink, self.unit[0..self.unit_len], string.kind, flags.reply_fragment);
             },
-            // After 20 ms of silence the rest of the garbage is more likely typing.
+            // After the timeout the rest of the garbage is more likely typing.
             .discard => self.state = .ground,
             .ground, .expired, .paste => unreachable,
         }

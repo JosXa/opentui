@@ -14,13 +14,21 @@ function events(parser: Parser): StdinEvent[] {
   return out
 }
 
-function parse(create: (options: StdinParserOptions) => Parser, chunks: (string | Uint8Array)[], options = {}) {
+type Chunk = string | Uint8Array | null
+
+/** A null chunk is a 25 ms pause, past the 20 ms timeout, that drains what it resolved. */
+function parse(create: (options: StdinParserOptions) => Parser, chunks: Chunk[], options = {}) {
   const clock = new ManualClock()
   const parser = create({ armTimeouts: true, clock, timeoutMs: 20, ...options })
+  const out: StdinEvent[] = []
   try {
-    for (const chunk of chunks) parser.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk)
+    for (const chunk of chunks) {
+      if (chunk !== null) parser.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk)
+      else clock.advance(25)
+      out.push(...events(parser))
+    }
     clock.advance(20)
-    return events(parser)
+    return [...out, ...events(parser)]
   } finally {
     parser.destroy()
   }
@@ -45,7 +53,7 @@ function summary(event: StdinEvent | undefined): unknown {
 
 describe("native stdin parser: intentional changes (docs §14.3)", () => {
   const cases: Array<
-    [label: string, chunks: (string | Uint8Array)[], legacy: unknown[], native: unknown[], options?: StdinParserOptions]
+    [label: string, chunks: Chunk[], legacy: unknown[], native: unknown[], options?: StdinParserOptions]
   > = [
     [
       "ESC inside OSC ends the string instead of waiting for the timeout",
@@ -140,6 +148,17 @@ describe("native stdin parser: intentional changes (docs §14.3)", () => {
       [{ key: "", raw: "\x1b[97;5u", ctrl: false, meta: false, shift: false }],
       [{ key: "a", raw: "\x1b[97;5u", ctrl: true, meta: false, shift: false }],
       { useKittyKeyboard: false },
+    ],
+    [
+      "an awaited OSC reply split by a pause stays a reply (issue 342)",
+      ["\x1b]11;rg", null, "b:0/0/0\x07"],
+      [
+        { response: "unknown", sequence: "\x1b]11;rg" },
+        ..."b:0/0/0".split("").map((name) => ({ key: name, raw: name, ctrl: false, meta: false, shift: false })),
+        { key: "g", raw: "\x07", ctrl: true, meta: false, shift: false },
+      ],
+      [{ response: "osc", sequence: "\x1b]11;rgb:0/0/0\x07" }],
+      { protocolContext: { privateCapabilityRepliesActive: true } },
     ],
   ]
   for (const [label, chunks, legacyEvents, nativeEvents, options] of cases) {
