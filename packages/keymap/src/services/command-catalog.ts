@@ -25,7 +25,7 @@ import type { ConditionService } from "./conditions.js"
 import { createFieldCompilerContext } from "./primitives/field-invariants.js"
 import type { NotificationService } from "./notify.js"
 import type { ActiveCommandView, LayerCommandEntry, CommandView, ResolvedCommandEntry, State } from "./state.js"
-import { getErrorMessage } from "./values.js"
+import { getErrorMessage, isPlainData } from "./values.js"
 
 const DEFAULT_COMMAND_SEARCH_FIELDS = ["name"] as const
 
@@ -957,7 +957,9 @@ function normalizeCommands<TTarget extends object, TEvent extends KeymapEvent>(
         continue
       }
 
-      if (!options.owned) command.name = normalizedName
+      // A compiled command that is not plain data (a transformer can make one) is handed out as it is.
+      const owned = options.owned && isPlainData(command)
+      if (!owned) command.name = normalizedName
 
       for (const [fieldName, value] of Object.entries(fields)) {
         if (value === undefined) {
@@ -990,7 +992,7 @@ function normalizeCommands<TTarget extends object, TEvent extends KeymapEvent>(
         matchers,
       }
 
-      if (options.owned) commandState.command = ownCommand(commandState, normalizedName)
+      if (owned) commandState.command = ownCommand(commandState, normalizedName)
       seen.add(commandState.command.name)
       normalizedCommands.push(commandState)
     } catch (error) {

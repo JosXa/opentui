@@ -969,6 +969,9 @@ describe("keymap: commands and queries", () => {
       retained.run({} as never)
       ;(retained.meta as { call?: () => void } | undefined)?.call?.()
       expect([change, events, calls, keymap.getCommands().length]).toEqual([change, ...outcomes[outcome]])
+      // A command that is not plain data is handed out as it is, with its symbol keys and function properties.
+      if (change === "symbol key") expect((retained as Record<symbol, unknown>)[symbol]).toBe(1)
+      if (change === "function with properties") expect((retained.run as { tag?: unknown }).tag).toBeDefined()
       armed = false
       expect([{ ...first }, { ...next }]).toEqual(copies)
     }
@@ -1002,6 +1005,7 @@ describe("keymap: commands and queries", () => {
 
   test("the plain-data check covers the layer object itself", () => {
     const commands = (...names: string[]) => names.map((name) => ({ name, run() {} }))
+    const shared = { name: "c", meta: { label: "a" }, run() {} }
     const hidden = (key: string, value: unknown, layer: object = { commands: commands("c") }) =>
       Object.defineProperty(layer, key, { value })
     const rows: [string, () => object, () => object, string[]][] = [
@@ -1028,6 +1032,16 @@ describe("keymap: commands and queries", () => {
         ["c"],
       ],
       ["non-enumerable priority", () => hidden("priority", 0), () => hidden("priority", 10), ["c"]],
+      // Kept only if the registered layer was compiled from a copy: this one holds the caller's `meta`.
+      [
+        "frozen layer, then its data changed in place",
+        () => Object.freeze({ commands: [shared] }),
+        () => {
+          shared.meta.label = "b"
+          return { commands: [shared] }
+        },
+        ["c"],
+      ],
       [
         "non-enumerable commands",
         () => hidden("commands", commands("c"), {}),
@@ -1043,9 +1057,17 @@ describe("keymap: commands and queries", () => {
       let events = 0
       keymap.on("state", () => void (events += 1))
 
-      layers.replaceLayer(registered, next() as never)
-      const registeredNames = keymap.getCommands({ visibility: "registered" }).map((command) => command.name)
-      expect([change, events, registeredNames]).toEqual([change, 1, names])
+      const layer = next() as { commands: object[] }
+      layers.replaceLayer(registered, layer as never)
+      const registeredCommands = keymap.getCommands({ visibility: "registered" })
+      const plainNext = change.startsWith("frozen layer, then")
+      const sameObjects = plainNext || registeredCommands.every((command, index) => command === layer.commands[index])
+      expect([change, events, registeredCommands.map(({ name }) => name), sameObjects]).toEqual([
+        change,
+        1,
+        names,
+        true,
+      ])
     }
   })
 
@@ -1114,6 +1136,88 @@ describe("keymap: commands and queries", () => {
     const registered = impure.getCommandEntries({ visibility: "registered" })
     const used = registered.map(({ command, bindings }) => [command.title, stringifyKeySequence(bindings[0]!.sequence)])
     expect(used).toEqual([["title 2", "y"]])
+  })
+
+  test("compile hooks that make the compiled layer not plain data cause a full replace", () => {
+    const calls: string[] = []
+    let compiles = 0
+    let getterRuns = 0
+    const attr = (value: (compile: number) => unknown) => (keymap: OpenTuiKeymap) =>
+      keymap.registerCommandFields({ meta: (_value, ctx) => ctx.attr("meta", value(compiles++)) })
+    const map = new Map<string, number>()
+    const throwing = new Proxy(
+      { label: "" },
+      {
+        getOwnPropertyDescriptor: () => {
+          throw new Error("unreadable")
+        },
+      },
+    )
+    // Each hook runs on both compiles. Commands that are not plain data are handed out as they are; other
+    // compiled values that are not plain data compare unequal, without running getters.
+    const hooks: [string, (keymap: OpenTuiKeymap) => void][] = [
+      [
+        "prototype run",
+        (keymap) =>
+          keymap.appendCommandTransformer((command) => {
+            const { run } = command
+            delete (command as { run?: unknown }).run
+            Object.setPrototypeOf(command, { run })
+          }),
+      ],
+      [
+        "non-enumerable run",
+        (keymap) =>
+          keymap.appendCommandTransformer((command) => {
+            Object.defineProperty(command, "run", { value: command.run, enumerable: false })
+          }),
+      ],
+      [
+        "command field whose descriptors throw",
+        (keymap) => keymap.appendCommandTransformer((command) => void (command.meta = throwing)),
+      ],
+      ["map attr changed in place", attr((compile) => map.set("compiles", compile))],
+      ["function attr with properties", attr(() => Object.assign(() => {}, { tag: 1 }))],
+      [
+        "getter attr in both layers",
+        attr(() => ({
+          get label() {
+            return String(getterRuns++)
+          },
+        })),
+      ],
+      // Compared through its descriptors, which are equal, so the layer is kept without running the trap.
+      ["attr proxy whose reads run code", attr(() => new Proxy({ label: "0" }, { get: () => String(getterRuns++) }))],
+      [
+        "getter attr in the kept layer",
+        attr((compile) =>
+          compile === 0
+            ? {
+                get label() {
+                  return String(getterRuns++)
+                },
+              }
+            : { label: "0" },
+        ),
+      ],
+      ["attr whose descriptors throw", attr(() => throwing)],
+    ]
+
+    for (const [hook, install] of hooks) {
+      const keymap = getKeymap(renderer)
+      const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
+      install(keymap)
+      compiles = 0
+      const layerOf = (label: string) => ({ commands: [{ name: "c", meta: 1, run: () => void calls.push(label) }] })
+      const registered = layers.replaceLayer(undefined, layerOf("old"))
+      let events = 0
+      keymap.on("state", () => void (events += 1))
+
+      layers.replaceLayer(registered, layerOf("new"))
+      calls.length = 0
+      keymap.runCommand("c")
+      expect([hook, events, calls, getterRuns]).toEqual([hook, hook.startsWith("attr proxy") ? 0 : 1, ["new"], 0])
+    }
   })
 
   test("a replace compiles from the one read it compares", () => {

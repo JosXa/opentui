@@ -187,10 +187,15 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
 
   // Compares what the layers use: the target by identity and the compiled data by content. Reactive matchers
   // subscribe on registration, so a layer with one never compares equal.
-  const sameCompiledLayer = (kept: RegisteredLayer<TTarget, TEvent>, next: RegisteredLayer<TTarget, TEvent>) =>
-    kept.target === next.target &&
-    !conditionTargets(next).some((target) => target.matchers.some((matcher) => matcher.subscribe)) &&
-    sameCompiledData(compiledData(kept), compiledData(next))
+  const sameCompiledLayer = (kept: RegisteredLayer<TTarget, TEvent>, next: RegisteredLayer<TTarget, TEvent>) => {
+    if (kept.target !== next.target) return false
+    if (conditionTargets(next).some((target) => target.matchers.some((matcher) => matcher.subscribe))) return false
+    try {
+      return sameCompiledData(compiledData(kept), compiledData(next), kept.target)
+    } catch {
+      return false
+    }
+  }
 
   const compileLayer = (
     layer: Layer<TTarget, TEvent>,

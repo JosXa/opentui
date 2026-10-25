@@ -16,9 +16,7 @@ const PLAIN_FUNCTION_KEYS = new Set<PropertyKey>(["length", "name", "prototype"]
 // non-enumerable or `__proto__` keys, cycles or data deeper than 16) returns `NOT_PLAIN_DATA`. The
 // top-level `identityKey` value is kept as it is (a layer's target).
 export function copyPlainData(value: unknown, identityKey?: string, depth = 0): unknown {
-  if (typeof value === "function") {
-    return Reflect.ownKeys(value).every((key) => PLAIN_FUNCTION_KEYS.has(key)) ? value : NOT_PLAIN_DATA
-  }
+  if (typeof value === "function") return isPlainFunction(value) ? value : NOT_PLAIN_DATA
   if (typeof value !== "object" || value === null) return value
 
   const isArray = Array.isArray(value)
@@ -39,19 +37,45 @@ export function copyPlainData(value: unknown, identityKey?: string, depth = 0): 
   return copy
 }
 
-// Compares compiled layer data: arrays and plain objects (frozen ones too) by content, any two functions as
-// equal, and everything else by identity. Data deeper than 32 compares unequal.
-export function sameCompiledData(left: unknown, right: unknown, depth = 0): boolean {
-  if (Object.is(left, right)) return true
-  if (typeof left === "function") return typeof right === "function"
+// Whether `copyPlainData` accepts a value; a value that throws while read is not plain data.
+export function isPlainData(value: unknown): boolean {
+  try {
+    return copyPlainData(value) !== NOT_PLAIN_DATA
+  } catch {
+    return false
+  }
+}
+
+// Compares compiled layer data through property descriptors, so no getter runs: arrays and plain objects (frozen
+// ones too) with enumerable string-keyed data properties by content, and functions without own properties as
+// equal. `shared` (the layer's target) compares by identity. Anything else (other objects, accessors, symbol or
+// non-enumerable keys, functions with properties, data deeper than 32) compares unequal.
+export function sameCompiledData(left: unknown, right: unknown, shared: unknown, depth = 0): boolean {
+  if (left === shared && right === shared) return true
+  if (typeof left === "function") return typeof right === "function" && isPlainFunction(left) && isPlainFunction(right)
+  if (typeof left !== "object" || left === null) return Object.is(left, right)
   if (!isContainer(left) || !isContainer(right) || Array.isArray(left) !== Array.isArray(right)) return false
   if (depth >= COMPILED_DEPTH_MAX) return false
 
   const keys = Reflect.ownKeys(left)
   return (
     keys.length === Reflect.ownKeys(right).length &&
-    keys.every((key) => Object.hasOwn(right, key) && sameCompiledData(left[key], right[key], depth + 1))
+    keys.every((key) => {
+      const before = Object.getOwnPropertyDescriptor(left, key)
+      const after = Object.getOwnPropertyDescriptor(right, key)
+      if (typeof key !== "string" || !before || !after || !("value" in before) || !("value" in after)) return false
+      const enumerable = before.enumerable || (Array.isArray(left) && key === "length")
+      return (
+        enumerable &&
+        after.enumerable === before.enumerable &&
+        sameCompiledData(before.value, after.value, shared, depth + 1)
+      )
+    })
   )
+}
+
+function isPlainFunction(value: object): boolean {
+  return Reflect.ownKeys(value).every((key) => PLAIN_FUNCTION_KEYS.has(key))
 }
 
 function isContainer(value: unknown): value is Record<PropertyKey, unknown> {
