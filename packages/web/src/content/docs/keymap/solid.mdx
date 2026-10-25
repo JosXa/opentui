@@ -102,7 +102,7 @@ The hook replaces its layer in one update, so `state` listeners see one change. 
 position: among layers of the same priority, precedence follows mount order, and only a newly mounted layer goes
 on top. Earlier versions moved a re-registered layer to the top.
 
-If the layer is plain data, has the same data as the registered one, and differs only in its functions, such as
+If the layer is plain data, compiles to the same data as the registered one, and differs only in functions, such as
 fresh `run` or `enabled` closures, the hook keeps the registered layer. Plain data means plain objects, arrays and
 primitives with enumerable string keys, and functions without properties of their own, from the layer object
 down; no class instances, `Map`s, getters, symbol or `__proto__` keys, or frozen or sealed objects. A Solid store

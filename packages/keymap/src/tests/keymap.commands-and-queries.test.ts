@@ -19,6 +19,7 @@ import {
   type WarningEvent,
 } from "../index.js"
 import { createDefaultOpenTuiKeymap, createOpenTuiKeymap } from "../opentui.js"
+import { createTestKeymap } from "../testing/index.js"
 import { createDiagnosticHarness } from "./diagnostic-harness.js"
 import { createKeymapTestHelpers, type OpenTuiKeymap } from "./keymap.test-support.js"
 
@@ -895,6 +896,7 @@ describe("keymap: commands and queries", () => {
         "replaced",
       ],
       ["getter", getter("old"), getter("new"), "replaced"],
+      ["plain after a getter", getter("old"), command("new", { title: "t" }), "replaced"],
       ["non-enumerable key", hidden("old"), hidden("new"), "replaced"],
       [
         "frozen object",
@@ -1047,26 +1049,105 @@ describe("keymap: commands and queries", () => {
     }
   })
 
-  test("a replace keeps the same target, and fully replaces for another target or a changed compile registry", () => {
+  test("a replace compares the target by identity and the compiled layer by content", () => {
+    const keymap = getKeymap(renderer)
+    const plain = createTestKeymap()
+    const first = createFocusableBox("first")
+    const layerOf = (target: object, key = "x") => ({
+      target,
+      commands: [{ name: "c", run() {} }],
+      bindings: [{ key, cmd: "c" }],
+    })
+    const counts: Record<string, number> = {}
+    const replaceIn = (target: typeof keymap | typeof plain.keymap, step: string, steps: [string, () => object][]) => {
+      const { layers } = target[KEYMAP_EXTENSION_CONTEXT]()
+      let registered: unknown
+      let events = 0
+      target.on("state", () => void (events += 1))
+      for (const [name, layer] of steps) {
+        events = 0
+        registered = layers.replaceLayer(registered as never, layer() as never)
+        if (name) counts[`${step} ${name}`] = events
+      }
+    }
+    let titles = 0
+    let keys = 0
+
+    replaceIn(keymap, "renderable", [
+      ["", () => layerOf(first)],
+      ["same", () => layerOf(first)],
+      ["other", () => layerOf(createFocusableBox("second"))],
+    ])
+    replaceIn(plain.keymap, "plain target", [
+      ["", () => layerOf({ id: "t" })],
+      ["deeply equal", () => layerOf({ id: "t" })],
+    ])
+    const impure = getKeymap(renderer)
+    impure.appendCommandTransformer((command) => void (command.title = `title ${titles++}`))
+    impure.appendLayerBindingsTransformer((bindings) =>
+      bindings.map((binding) => ({ ...binding, key: keys++ === 0 ? "x" : "y" })),
+    )
+    const cyclic = getKeymap(renderer)
+    cyclic.appendCommandTransformer((command) => {
+      const meta: Record<string, unknown> = {}
+      command.meta = Object.assign(meta, { self: meta })
+    })
+    replaceIn(cyclic, "cyclic transformer output", [
+      ["", () => layerOf(first)],
+      ["again", () => layerOf(first)],
+    ])
+    replaceIn(impure, "impure transformers", [
+      ["", () => layerOf(first, "q")],
+      ["first", () => layerOf(first, "q")],
+      ["second", () => layerOf(first, "q")],
+    ])
+    plain.cleanup()
+
+    expect(counts).toEqual({
+      "renderable same": 0,
+      "renderable other": 1,
+      "plain target deeply equal": 1,
+      "cyclic transformer output again": 1,
+      "impure transformers first": 1,
+      "impure transformers second": 1,
+    })
+    const registered = impure.getCommandEntries({ visibility: "registered" })
+    const used = registered.map(({ command, bindings }) => [command.title, stringifyKeySequence(bindings[0]!.sequence)])
+    expect(used).toEqual([["title 2", "y"]])
+  })
+
+  test("a replace compiles from the one read it compares", () => {
     const keymap = getKeymap(renderer)
     const { layers } = keymap[KEYMAP_EXTENSION_CONTEXT]()
-    const first = createFocusableBox("first")
-    const layerOf = (target: Renderable) => ({ target, commands: [{ name: "c", run() {} }] })
-    const counts: number[] = []
+    let reads = 0
+    let armed = false
+    // Once armed, the first read of `title` and every third after it return "t"; the others a new value.
+    const layerOf = () => ({
+      commands: [
+        new Proxy(
+          { name: "c", title: "t", run() {} },
+          {
+            get: (target, key) =>
+              key === "title" && armed ? (++reads % 3 === 1 ? "t" : `c${reads}`) : Reflect.get(target, key),
+          },
+        ),
+      ],
+    })
     let events = 0
     keymap.on("state", () => void (events += 1))
-    let registered = layers.replaceLayer(undefined, layerOf(first))
-    const replace = (layer: object) => {
-      events = 0
-      registered = layers.replaceLayer(registered, layer as never)
-      counts.push(events)
-    }
 
-    replace(layerOf(first))
-    replace(layerOf(createFocusableBox("second")))
-    keymap.appendCommandTransformer(() => {})
-    replace(layerOf(registered!.target!))
-    expect(counts).toEqual([0, 1, 1])
+    let registered = layers.replaceLayer(undefined, layerOf())
+    armed = true
+    const seen: unknown[] = []
+    for (let step = 0; step < 2; step += 1) {
+      events = 0
+      registered = layers.replaceLayer(registered, layerOf())
+      seen.push([events, keymap.getCommands()[0]!.title])
+    }
+    expect(seen).toEqual([
+      [0, "t"],
+      [1, "c2"],
+    ])
   })
 
   test("a failed reactive subscription is retried by the next replace", () => {

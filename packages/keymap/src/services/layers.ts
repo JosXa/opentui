@@ -25,7 +25,7 @@ import type { NotificationService } from "./notify.js"
 import { snapshotBindings, validateBindings } from "./primitives/bindings.js"
 import { createFieldCompilerContext } from "./primitives/field-invariants.js"
 import { buildSequenceTree } from "./sequence-index.js"
-import { getErrorMessage, NOT_PLAIN_DATA, samePlainData, snapshotDataValue, snapshotPlainData } from "./values.js"
+import { copyPlainData, getErrorMessage, NOT_PLAIN_DATA, sameCompiledData, snapshotDataValue } from "./values.js"
 
 const NOOP = (): void => {}
 
@@ -35,6 +35,14 @@ function compareLayers<TTarget extends object, TEvent extends KeymapEvent>(
 ): number {
   const priorityDiff = right.priority - left.priority
   return priorityDiff || right.order - left.order
+}
+
+// What dispatch and queries read from a layer: everything but its target, order, sequence tree (built from
+// `bindings`) and bookkeeping.
+function compiledData<TTarget extends object, TEvent extends KeymapEvent>(layer: RegisteredLayer<TTarget, TEvent>) {
+  const { target: _target, order: _order, root: _root, offTargetDestroy: _off, ...data } = layer
+  const { activeKeyCacheBlocked: _keys, activeCommandViewCacheBlocked: _commands, ...compiled } = data
+  return compiled
 }
 
 function conditionTargets<TTarget extends object, TEvent extends KeymapEvent>(
@@ -107,9 +115,9 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
   activation: ActivationService<TTarget, TEvent>,
   options: LayersOptions<TTarget, TEvent>,
 ): LayerService<TTarget, TEvent> {
-  // For layers that `replaceLayer` registered from plain data: a copy of that data, and the last result of
-  // each `enabled` condition that `state` listeners have seen (at registration or at the last event).
-  const shapes = new WeakMap<RegisteredLayer<TTarget, TEvent>, unknown>()
+  // Layers that `replaceLayer` compiled from a plain-data copy, and the last result of each of their
+  // `enabled` conditions that `state` listeners have seen (at registration or at the last event).
+  const copiedLayers = new WeakSet<RegisteredLayer<TTarget, TEvent>>()
   const seenEnabled = new WeakMap<RuntimeMatchable, boolean>()
 
   const recordEnabled = (layer: RegisteredLayer<TTarget, TEvent>): void => {
@@ -119,7 +127,7 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
   }
 
   notify.onStateEvent(() => {
-    for (const layer of state.layers) if (shapes.has(layer)) recordEnabled(layer)
+    for (const layer of state.layers) if (copiedLayers.has(layer)) recordEnabled(layer)
   })
 
   const registerLayer = (layer: Layer<TTarget, TEvent>): (() => void) => {
@@ -131,22 +139,19 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
     })
   }
 
-  // Replaces `previous` in one state batch, in its position: precedence follows mount order. A layer whose
-  // plain data matches `previous` (functions aside) keeps the registered objects, which then call the new
-  // functions, and emits `state` only if an `enabled` result differs from the one listeners have seen.
-  // Anything else takes the full replace.
+  // Replaces `previous` in one state batch, in its position: precedence follows mount order. A plain-data
+  // layer is compiled from a copy read once, and if its compiled data matches `previous` (functions aside),
+  // the registered objects stay and call the new functions; `state` fires only if an `enabled` result
+  // differs from the one listeners have seen. Anything else takes the full replace.
   const replaceLayer = (
     previous: RegisteredLayer<TTarget, TEvent> | undefined,
     layer: Layer<TTarget, TEvent> | undefined,
   ): RegisteredLayer<TTarget, TEvent> | undefined => {
     return notify.runWithStateChangeBatch(() => {
       const kept = previous && state.layers.has(previous) ? previous : undefined
-      const shape = layer && snapshotLayer(layer)
-      const next = layer && compileLayer(layer, shape !== undefined, kept?.order)
-      const keptShape = kept && shapes.get(kept)
-      // Reactive matchers subscribe on registration, so a layer with one is always replaced.
-      const reactive = next && conditionTargets(next).some((target) => target.matchers.some((m) => m.subscribe))
-      if (kept && next && shape && keptShape && !reactive && samePlainData(keptShape, shape)) {
+      const copy = layer && copyLayer(layer)
+      const next = layer && compileLayer(copy ?? layer, copy !== undefined, kept?.order)
+      if (kept && next && copy && copiedLayers.has(kept) && sameCompiledLayer(kept, next)) {
         refreshLayer(kept, next)
         return kept
       }
@@ -156,8 +161,8 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
       if (!next) return undefined
 
       addLayer(next)
-      if (shape) {
-        shapes.set(next, shape)
+      if (copy) {
+        copiedLayers.add(next)
         recordEnabled(next)
       }
       if (position >= 0) {
@@ -170,20 +175,22 @@ export function createLayerService<TTarget extends object, TEvent extends Keymap
     })
   }
 
-  // What a re-registration compares: a plain-data copy of the whole layer (its target by identity) and the
-  // compile registries by identity. Undefined when the layer is not plain data, or when reading it throws.
-  const snapshotLayer = (layer: Layer<TTarget, TEvent>): unknown[] | undefined => {
+  // A plain-data copy of the layer, its target as it is; undefined when it is not plain data or reading throws.
+  const copyLayer = (layer: Layer<TTarget, TEvent>): Layer<TTarget, TEvent> | undefined => {
     try {
-      const copy = snapshotPlainData(layer, "target")
-      if (copy === NOT_PLAIN_DATA) return undefined
-      const { layerBindingsTransformers, bindingExpanders, bindingParsers, bindingTransformers } = state
-      const registries = [layerBindingsTransformers, bindingExpanders, bindingParsers, bindingTransformers]
-      const fields = [...state.layerFields.values(), ...state.bindingFields.values(), ...state.commandFields.values()]
-      return [copy, fields, state.commandTransformers.values(), ...registries.map((item) => item.values())]
+      const copy = copyPlainData(layer, "target")
+      return copy === NOT_PLAIN_DATA ? undefined : (copy as Layer<TTarget, TEvent>)
     } catch {
       return undefined
     }
   }
+
+  // Compares what the layers use: the target by identity and the compiled data by content. Reactive matchers
+  // subscribe on registration, so a layer with one never compares equal.
+  const sameCompiledLayer = (kept: RegisteredLayer<TTarget, TEvent>, next: RegisteredLayer<TTarget, TEvent>) =>
+    kept.target === next.target &&
+    !conditionTargets(next).some((target) => target.matchers.some((matcher) => matcher.subscribe)) &&
+    sameCompiledData(compiledData(kept), compiledData(next))
 
   const compileLayer = (
     layer: Layer<TTarget, TEvent>,
