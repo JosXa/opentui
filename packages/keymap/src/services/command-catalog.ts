@@ -25,7 +25,7 @@ import type { ConditionService } from "./conditions.js"
 import { createFieldCompilerContext } from "./primitives/field-invariants.js"
 import type { NotificationService } from "./notify.js"
 import type { ActiveCommandView, LayerCommandEntry, CommandView, ResolvedCommandEntry, State } from "./state.js"
-import { getErrorMessage, isPlainData } from "./values.js"
+import { createForwarder, getErrorMessage, isPlainData } from "./values.js"
 
 const DEFAULT_COMMAND_SEARCH_FIELDS = ["name"] as const
 
@@ -913,22 +913,15 @@ export function getCommand<TTarget extends object, TEvent extends KeymapEvent>(
   return state.command
 }
 
-// Hands out a keymap-owned copy of a plain command whose methods call the latest registered object, so a
-// layer re-registered with fresh functions keeps the command objects that callers already hold.
+// Hands out a keymap-owned copy of a plain command whose methods are forwarders, so a layer re-registered
+// with fresh functions keeps the command objects that callers already hold.
 function ownCommand<TTarget extends object, TEvent extends KeymapEvent>(
-  state: CommandState<TTarget, TEvent>,
+  command: Command<TTarget, TEvent>,
   name: string,
 ): Command<TTarget, TEvent> {
-  const source = state.source
   const own: Record<string, unknown> = {}
-  for (const [key, value] of Object.entries(source)) {
-    own[key] =
-      typeof value !== "function"
-        ? value
-        : function (this: unknown, ...args: unknown[]) {
-            const latest = state.source as Record<string, unknown>
-            return Reflect.apply(latest[key] as (...args: unknown[]) => unknown, this === own ? latest : this, args)
-          }
+  for (const [key, value] of Object.entries(command)) {
+    own[key] = typeof value === "function" ? createForwarder(value) : value
   }
   own.name = name
   return own as unknown as Command<TTarget, TEvent>
@@ -985,14 +978,13 @@ function normalizeCommands<TTarget extends object, TEvent extends KeymapEvent>(
 
       const commandState: CommandState<TTarget, TEvent> = {
         command,
-        source: command,
         fields,
         attrs: Object.keys(attrs).length === 0 ? undefined : attrs,
         requires: Object.entries(mergedRequires),
         matchers,
       }
 
-      if (owned) commandState.command = ownCommand(commandState, normalizedName)
+      if (owned) commandState.command = ownCommand(command, normalizedName)
       seen.add(commandState.command.name)
       normalizedCommands.push(commandState)
     } catch (error) {

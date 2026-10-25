@@ -715,8 +715,6 @@ export interface CommandState<
   TEvent extends KeymapEvent = KeymapEvent,
 > extends RuntimeMatchable {
   command: Command<TTarget, TEvent, any>
-  /** The latest object the caller registered; `command` forwards its methods to it. */
-  source: Command<TTarget, TEvent, any>
   fields: Readonly<Record<string, unknown>>
   attrs?: Readonly<Attributes>
 }

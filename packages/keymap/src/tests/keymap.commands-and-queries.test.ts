@@ -4,6 +4,7 @@ import { BoxRenderable, KeyEvent, type Renderable } from "@opentui/core"
 import { createTestRenderer, type MockInput, type TestRenderer } from "@opentui/core/testing"
 import * as addons from "../addons/index.js"
 import { formatCommandBindings } from "../extras/index.js"
+import { getGraphSnapshot } from "../extras/graph.js"
 import {
   KEYMAP_EXTENSION_CONTEXT,
   stringifyKeySequence,
@@ -865,8 +866,8 @@ describe("keymap: commands and queries", () => {
         "replaced, retained meta",
       ],
       ["proxy that ignores writes", new Proxy(command("old"), { set: () => true }), command("new"), "kept"],
-      // The comparison reads the kept layer's source command too, and a throw there means a full replace.
-      ["proxy that throws once registered", throwing(command("old"), () => armed), command("new"), "replaced"],
+      // The kept layer is not read again, so a proxy that later throws does not matter.
+      ["proxy that throws once registered", throwing(command("old"), () => armed), command("new"), "kept"],
       ["enabled same result", command("old", { enabled: () => true }), command("new", { enabled: () => true }), "kept"],
       [
         "enabled flips",
@@ -964,6 +965,7 @@ describe("keymap: commands and queries", () => {
       const copies = [{ ...first }, { ...next }]
       const registered = layers.replaceLayer(undefined, { commands: [first as never] })
       const retained = keymap.getCommands({ visibility: "registered" })[0]!
+      const retainedRun = retained.run
       let events = 0
       keymap.on("state", () => void (events += 1))
       armed = true
@@ -980,6 +982,8 @@ describe("keymap: commands and queries", () => {
       calls.length = 0
       keymap.runCommand("c")
       retained.run({} as never)
+      // A kept command keeps its forwarding methods.
+      if (outcome.startsWith("kept")) expect([change, retained.run === retainedRun]).toEqual([change, true])
       ;(retained.meta as { call?: () => void } | undefined)?.call?.()
       expect([change, events, calls, keymap.getCommands().length]).toEqual([change, ...outcomes[outcome]])
       // A command that is not plain data is handed out as it is, with its symbol keys and function properties.
@@ -998,7 +1002,11 @@ describe("keymap: commands and queries", () => {
     keymap.on("dispatch", (event) => {
       if (event.layer && event.binding) orders.push([event.layer.order, event.binding.sourceLayerOrder])
     })
-    const layerOf = (version: string) => ({ bindings: [{ key: "y", cmd: () => void calls.push(version) }] })
+    // A layer `enabled` function sits in the frozen layer fields as a forwarder, so the layer is still kept.
+    const layerOf = (version: string) => ({
+      enabled: () => true,
+      bindings: [{ key: "y", cmd: () => void calls.push(version) }],
+    })
 
     const registered = layers.replaceLayer(undefined, layerOf("old"))
     layers.replaceLayer(undefined, { bindings: [{ key: "z", cmd: () => {} }] })
@@ -1009,7 +1017,11 @@ describe("keymap: commands and queries", () => {
     ;(getActiveKey(keymap, "y")!.command as () => void)()
     keymap.appendDisambiguationResolver(() => undefined)
     mockInput.pressKey("y")
-    expect(calls).toEqual(["new", "new", "new"])
+    // After the recompile, active keys hold the binding's forwarder again, so a later replace reaches them.
+    const recompiled = getActiveKey(keymap, "y")!.command as () => void
+    layers.replaceLayer(registered, layerOf("newest"))
+    recompiled()
+    expect(calls).toEqual(["new", "new", "new", "newest"])
     expect(orders).toEqual([
       [0, 0],
       [0, 0],
@@ -1229,7 +1241,15 @@ describe("keymap: commands and queries", () => {
       layers.replaceLayer(registered, layerOf("new"))
       calls.length = 0
       keymap.runCommand("c")
-      expect([hook, events, calls, getterRuns]).toEqual([hook, 1, ["new"], 0])
+      // The same object in both compiles (unreadable, or a Map changed in place) is unchanged by identity,
+      // as on main's API, so that layer is kept without reading it.
+      const same = [
+        "command field whose descriptors throw",
+        "map attr changed in place",
+        "attr whose descriptors throw",
+      ]
+      const expectedEvents = same.includes(hook) ? 0 : 1
+      expect([hook, events, calls, getterRuns]).toEqual([hook, expectedEvents, ["new"], 0])
     }
   })
 
@@ -1329,6 +1349,20 @@ describe("keymap: commands and queries", () => {
         (keymap) => keymap.getCommandBindings({ commands: ["c"] }).get("c")?.[0]?.attrs?.meta,
       ],
       [
+        // A function in the frozen binding attrs cannot move, so the layer is replaced.
+        "function binding attr from a field compiler",
+        (keymap) => keymap.registerBindingFields({ meta: (_value, ctx) => ctx.attr("meta", () => {}) }),
+        () => ({ commands: [{ name: "c", run() {} }], bindings: [{ key: "x", cmd: "c", meta: 1 }] }),
+        (keymap) => keymap.getCommandBindings({ commands: ["c"] }).get("c")?.[0]?.attrs?.meta,
+      ],
+      [
+        "command field from a command transformer",
+        (keymap) =>
+          keymap.appendCommandTransformer((command) => void (command.meta = compiles++ === 0 ? requirement : fresh())),
+        () => ({ commands: [{ name: "c", run() {} }] }),
+        (keymap) => keymap.getCommands({ filter: { meta: requirement } }).length,
+      ],
+      [
         "layer requirement from a field compiler",
         (keymap) =>
           keymap.registerLayerFields({
@@ -1393,6 +1427,154 @@ describe("keymap: commands and queries", () => {
       const result = typeof after === "boolean" ? after : before !== after
       expect([change, events > 0, result]).toEqual([change, true, !change.includes("requirement from")])
     }
+  })
+
+  test("differential: a kept layer changes nothing the public API hands out, a replaced one matches main", () => {
+    let seed = 334
+    const random = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648
+    const pick = <T>(items: readonly T[]) => items[Math.floor(random() * items.length)]!
+    const calls: string[] = []
+    const pool = { meta: { id: 1 }, audience: { id: 2 }, hint: { id: 3 }, section: { id: 4 } }
+    type Key = keyof typeof pool
+    // Hooks return the pooled object, or (when `freshHooks`) an equal new one.
+    let freshHooks = false
+    const hook = (key: Key) => (freshHooks ? { ...pool[key] } : pool[key])
+    const install = (keymap: OpenTuiKeymap) => {
+      keymap.registerLayerFields({ section: (_value, ctx) => ctx.attr("section", hook("section")) })
+      keymap.registerCommandFields({
+        audience: (value, ctx) => ctx.require("audience", value),
+        note: (_value, ctx) => ctx.attr("note", hook("meta")),
+      })
+      keymap.registerBindingFields({ hint: (_value, ctx) => ctx.attr("hint", hook("hint")) })
+      keymap.setData("audience", pool.audience)
+    }
+    type Spec = {
+      title: string
+      meta?: "pooled" | "fresh"
+      audience?: "pooled" | "fresh"
+      note?: number
+      key?: string
+      hint?: number
+      enabled?: boolean
+    }
+    const object = (key: Key, kind?: "pooled" | "fresh") => (kind === "fresh" ? { ...pool[key] } : kind && pool[key])
+    // A layer `enabled` function is a fresh closure on every build.
+    const layerOf = (specs: readonly Spec[], section: boolean, label: string, enabled = false) => ({
+      ...(section ? { section: 1 } : {}),
+      ...(enabled ? { enabled: () => true } : {}),
+      commands: specs.map((spec, index) => ({
+        name: `c${index}`,
+        title: spec.title,
+        ...(spec.meta ? { meta: object("meta", spec.meta) } : {}),
+        ...(spec.audience ? { audience: object("audience", spec.audience) } : {}),
+        ...(spec.note ? { note: spec.note } : {}),
+        ...(spec.enabled === undefined ? {} : { enabled: () => spec.enabled }),
+        run: () => void calls.push(`${label}:c${index}`),
+      })),
+      bindings: specs.flatMap((spec, index) =>
+        spec.key ? [{ key: spec.key, cmd: `c${index}`, ...(spec.hint ? { hint: spec.hint } : {}) }] : [],
+      ),
+    })
+    const randomSpec = (): Spec => ({
+      title: pick(["a", "b"]),
+      meta: pick([undefined, "pooled", "pooled", "fresh"] as const),
+      audience: pick([undefined, "pooled", "pooled", "fresh"] as const),
+      note: pick([undefined, 1]),
+      key: pick([undefined, "x", "y"]),
+      hint: pick([undefined, 1]),
+      enabled: pick([undefined, true, false]),
+    })
+    const vary = (spec: Spec): Spec => {
+      const change = pick(["same", "same", "same", "same", "same", "title", "meta", "audience", "enabled"] as const)
+      if (change === "title") return { ...spec, title: spec.title === "a" ? "b" : "a" }
+      if (change === "meta") return { ...spec, meta: pick(["pooled", "fresh"] as const) }
+      if (change === "audience") return { ...spec, audience: pick(["pooled", "fresh"] as const) }
+      if (change === "enabled") return { ...spec, enabled: !spec.enabled }
+      return spec
+    }
+    // Every object a public read hands out, by path; functions are left out (they move to the latest).
+    const read = (keymap: OpenTuiKeymap) => {
+      const names = keymap.getCommands({ visibility: "registered" }).map(({ name }) => name)
+      const reads = {
+        graph: getGraphSnapshot(keymap),
+        bindings: [...keymap.getCommandBindings({ visibility: "registered", commands: names }).entries()],
+        commands: keymap.getCommands({ visibility: "registered" }),
+        entries: keymap.getCommandEntries({ visibility: "registered" }),
+        keys: keymap.getActiveKeys({ includeBindings: true, includeMetadata: true }),
+      }
+      const objects = new Map<string, object>()
+      const walk = (value: unknown, path: string, depth: number) => {
+        if (typeof value !== "object" || value === null || depth > 8) return
+        objects.set(path, value)
+        if (
+          !Array.isArray(value) &&
+          Object.getPrototypeOf(value) !== Object.prototype &&
+          Object.getPrototypeOf(value) !== null
+        )
+          return
+        for (const [key, entry] of Object.entries(value)) walk(entry, `${path}.${key}`, depth + 1)
+      }
+      walk(reads, "", 0)
+      return objects
+    }
+    // What a reader sees: names, titles, fields, attrs, bindings, active keys and the command that dispatch runs.
+    const content = (keymap: OpenTuiKeymap, label: string) => {
+      calls.length = 0
+      const commands = keymap
+        .getCommands({ visibility: "registered" })
+        .map(({ name, title, meta, audience, note }) => [name, title, meta, audience, note])
+      const names = commands.map(([name]) => name as string)
+      for (const name of names) keymap.dispatchCommand(name)
+      const ran = calls.map((call) => call.replace(`${label}:`, ""))
+      const bindings = [...keymap.getCommandBindings({ visibility: "registered", commands: names }).entries()]
+      const keys = keymap
+        .getActiveKeys({ includeMetadata: true })
+        .map(({ display, command, bindingAttrs, commandAttrs }) => [display, command, bindingAttrs, commandAttrs])
+      return JSON.stringify({
+        commands,
+        ran,
+        keys,
+        bindings: bindings.map(([name, list]) => [name, list.map(({ attrs, commandAttrs }) => [attrs, commandAttrs])]),
+      })
+    }
+
+    const failures: string[] = []
+    let kept = 0
+    for (let trial = 0; trial < 300; trial += 1) {
+      const specs = Array.from({ length: 1 + Math.floor(random() * 3) }, randomSpec)
+      const section = random() < 0.5
+      const layerEnabled = random() < 0.1
+      const nextSpecs = specs.map(vary)
+      const tip = getKeymap(renderer)
+      const main = getKeymap(renderer)
+      install(tip)
+      install(main)
+      freshHooks = false
+      const { layers } = tip[KEYMAP_EXTENSION_CONTEXT]()
+      const registered = layers.replaceLayer(undefined, layerOf(specs, section, "first", layerEnabled))
+      const [first, second] = [read(tip), read(tip)]
+      const before = content(tip, "first")
+      let events = 0
+      tip.on("state", () => void (events += 1))
+
+      freshHooks = random() < 0.2
+      layers.replaceLayer(registered, layerOf(nextSpecs, section, "next", layerEnabled))
+      const after = content(tip, "next")
+      main.registerLayer(layerOf(nextSpecs, section, "next", layerEnabled))
+      const expected = content(main, "next")
+
+      if (after !== expected) failures.push(`${trial}: results differ from main`)
+      if (events === 0) {
+        kept += 1
+        if (after !== before) failures.push(`${trial}: results changed without an event`)
+        const third = read(tip)
+        for (const [path, object] of first) {
+          if (second.get(path) === object && third.get(path) !== object) failures.push(`${trial}: ${path} changed`)
+        }
+      }
+    }
+    // About 40 of the 300 trials take the fast path.
+    expect([failures.slice(0, 5), kept >= 25]).toEqual([[], true])
   })
 
   test("a failed reactive subscription is retried by the next replace", () => {

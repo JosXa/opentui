@@ -37,14 +37,64 @@ function checkPlainData(value: unknown, identityKey: string | undefined, depth: 
   })
 }
 
-// Compares compiled layer data through property descriptors, so no getter runs: arrays and plain objects (frozen
-// ones too) with enumerable string-keyed data properties by content, and functions without own properties as
-// equal. `shared` (the layer's target) compares by identity. Anything else (other objects, accessors, symbol or
-// non-enumerable keys, functions with properties, data deeper than 32) compares unequal.
-export function sameCompiledData(left: unknown, right: unknown, shared: unknown, depth = 0): boolean {
-  if (left === shared && right === shared) return true
+// Stable functions that call their current target; a kept layer keeps them and moves their targets.
+const forwardTargets = new WeakMap<object, { target: unknown }>()
+
+export function createForwarder<T>(target: T): T {
+  const cell = { target }
+  const forward = function (this: unknown, ...args: unknown[]) {
+    return Reflect.apply(cell.target as (...args: unknown[]) => unknown, this, args)
+  }
+  forwardTargets.set(forward, cell)
+  return forward as T
+}
+
+// Objects that the caller or a compile hook supplied while a layer compiles: they compare by identity.
+let external: WeakSet<object> | undefined
+
+export function collectExternal<T>(objects: WeakSet<object>, compile: () => T): T {
+  const previous = external
+  external = objects
+  try {
+    return compile()
+  } finally {
+    external = previous
+  }
+}
+
+// Marks a supplied value and the arrays and plain objects inside it as external.
+export function markExternal(value: unknown, depth = 0): void {
+  if (!external || typeof value !== "object" || value === null || external.has(value)) return
+  external.add(value)
+  try {
+    if (depth >= DEPTH_MAX || !(Array.isArray(value) || isPlainObject(value))) return
+    for (const key of Reflect.ownKeys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)
+      if (descriptor && "value" in descriptor) markExternal(descriptor.value, depth + 1)
+    }
+  } catch {
+    // An object that cannot be read is marked; whatever it holds stays unread.
+  }
+}
+
+// Whether new compiled layer data equals the kept data, so the kept layer can stay whole. Reads property
+// descriptors only, so no getter runs. Objects in `external` (supplied by the caller or a hook) compare by
+// identity; other arrays and plain objects (made by the compile, frozen ones too) by their enumerable
+// string-keyed data properties; primitives by value. Two functions without own properties are equal: for a
+// forwarder, `moves` gets its new target; otherwise the new function goes into the kept container, unless
+// the slot cannot be written, which makes the data unequal. Anything else, or data deeper than 32, is
+// unequal.
+export function sameCompiledData(
+  left: unknown,
+  right: unknown,
+  external: WeakSet<object>,
+  moves: [object, string, unknown][],
+  depth = 0,
+): boolean {
+  if (Object.is(left, right)) return true
   if (typeof left === "function") return typeof right === "function" && isPlainFunction(left) && isPlainFunction(right)
-  if (typeof left !== "object" || left === null) return Object.is(left, right)
+  if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) return false
+  if (external.has(left) || external.has(right)) return false
   if (!isContainer(left) || !isContainer(right) || Array.isArray(left) !== Array.isArray(right)) return false
   if (depth >= COMPILED_DEPTH_MAX) return false
 
@@ -56,11 +106,15 @@ export function sameCompiledData(left: unknown, right: unknown, shared: unknown,
       const after = Object.getOwnPropertyDescriptor(right, key)
       if (typeof key !== "string" || !before || !after || !("value" in before) || !("value" in after)) return false
       const enumerable = before.enumerable || (Array.isArray(left) && key === "length")
-      return (
-        enumerable &&
-        after.enumerable === before.enumerable &&
-        sameCompiledData(before.value, after.value, shared, depth + 1)
-      )
+      if (!enumerable || after.enumerable !== before.enumerable) return false
+      if (!sameCompiledData(before.value, after.value, external, moves, depth + 1)) return false
+      if (typeof before.value !== "function" || before.value === after.value) return true
+      const cell = forwardTargets.get(before.value)
+      const nextCell = forwardTargets.get(after.value as object)
+      if (cell && nextCell) moves.push([cell, "target", nextCell.target])
+      else if (!cell && before.writable) moves.push([left, key, after.value])
+      else return false
+      return true
     })
   )
 }
