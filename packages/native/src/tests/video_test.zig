@@ -470,6 +470,63 @@ test "video rejects sources beyond the image limits" {
     try testing.expectEqual(@as(u64, 1), value.decodedFrames());
 }
 
+// FFmpeg logs from the decode worker and the audio thread; on a terminal app, stderr is the
+// screen the renderer draws.
+test "video decoding of a damaged file writes nothing to stderr" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    try decodeDamagedWithStderrCaptured();
+}
+
+fn decodeDamagedWithStderrCaptured() !void {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, asset, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    var position: usize = 8000;
+    while (position < bytes.len) : (position += 60) bytes[position] ^= 0x5a;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "damaged.mp4", .data = bytes });
+    const path = try tmp.dir.realPathFileAlloc(testing.io, "damaged.mp4", testing.allocator);
+    defer testing.allocator.free(path);
+
+    var pipe: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&pipe));
+    defer _ = std.c.close(pipe[0]);
+    const saved = std.c.dup(2);
+    try testing.expect(saved >= 0);
+    try testing.expect(std.c.dup2(pipe[1], 2) >= 0);
+    _ = std.c.close(pipe[1]);
+    var failures: u32 = 0;
+    {
+        defer {
+            _ = std.c.dup2(saved, 2);
+            _ = std.c.close(saved);
+        }
+        var detail: [256]u8 = undefined;
+        const value = try video.Video.open(testing.allocator, path, true, &detail);
+        defer value.deinit();
+        try value.configureOutput(32, 18, false);
+        var target: i64 = 0;
+        while (target < 2_000_000) : (target += frame_us) {
+            _ = value.update(target) catch {
+                failures += 1;
+            };
+        }
+        var samples: [4096 * 2]f32 = undefined;
+        while (true) {
+            const frames = value.readAudio(&samples, 4096) catch {
+                failures += 1;
+                break;
+            };
+            if (frames == 0) break;
+        }
+    }
+    var buffer: [256]u8 = undefined;
+    const count = std.c.read(pipe[0], &buffer, buffer.len);
+    try testing.expect(failures > 0);
+    if (count > 0) std.debug.print("stderr: {s}\n", .{buffer[0..@intCast(count)]});
+    try testing.expectEqual(@as(isize, 0), count);
+}
+
 test "video rejects sync offsets that would overflow the media clock" {
     const f = try Fixture.init(testing.allocator, 8, 4, .{});
     defer f.deinit();

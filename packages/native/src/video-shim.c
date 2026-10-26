@@ -87,6 +87,7 @@ void otv_cancel(otv_decoder *decoder, uint32_t cancel) {
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -374,6 +375,15 @@ static int ensure_audio_capacity(otv_decoder *decoder, size_t frames) {
     return OTV_OK;
 }
 
+// FFmpeg's default log callback writes to stderr from its decode threads, over the screen a
+// terminal app draws. Every failing call already records its status in the stream's error.
+static void otv_log_silent(void *context, int level, const char *format, va_list args) {
+    (void)context;
+    (void)level;
+    (void)format;
+    (void)args;
+}
+
 static void copy_open_error(const otv_decoder *decoder, char *error_out, uint32_t error_cap) {
     if (!error_out || error_cap == 0) return;
     snprintf(error_out, error_cap, "%s", decoder ? decoder->error : "video decoder allocation failed");
@@ -384,7 +394,7 @@ int otv_open(const char *path, const otv_limits *limits, otv_decoder **out_decod
     if (!path || !limits || !out_decoder || !out_info) return OTV_ERROR;
     *out_decoder = NULL;
     if (error_out && error_cap > 0) error_out[0] = '\0';
-    av_log_set_level(AV_LOG_ERROR);
+    av_log_set_callback(otv_log_silent);
     memset(out_info, 0, sizeof(*out_info));
     otv_decoder *decoder = calloc(1, sizeof(*decoder));
     if (!decoder) {
