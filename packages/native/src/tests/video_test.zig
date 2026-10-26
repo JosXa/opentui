@@ -207,6 +207,22 @@ test "video seek replaces queued PCM and restarts the clock at the target" {
     try testing.expectEqual(@as(i64, 1_100_000), state.current_time_us);
 }
 
+// Seeks while the audio thread refills: a seek repositions the audio decoder only between
+// refills, so the new stream holds every frame from the target to the end.
+test "video seeks during audio refills keep every frame of the new position" {
+    const value = try openAsset(false);
+    defer value.deinit();
+    value.setAudioOffline(true);
+    value.play();
+    for (0..50) |index| try value.seek(if (index % 2 == 0) 0 else 1_800_000);
+    for (0..2000) |_| {
+        if (value.getState().audio_produced_frames >= 9_600) break;
+        sleepMs(1);
+    }
+    sleepMs(20);
+    try testing.expectEqual(@as(u64, 9_600), value.getState().audio_produced_frames);
+}
+
 test "video external audio decodes PCM through manual reads" {
     const value = try openAsset(true);
     defer value.deinit();
@@ -693,6 +709,16 @@ test "video seek and teardown cancel a long decode" {
     try testing.expect(value.decodedFrames() - before < 100);
     try testing.expect(try value.update(0));
     try testing.expectEqual(@as(i64, 0), value.state.frame_pts_us);
+    // A new output size stops the decode first: the worker must not convert a frame while the
+    // shim replaces its scaler and buffer.
+    const resized = value.decodedFrames();
+    try testing.expect(try value.prepare(5_900_000));
+    while (value.decodedFrames() == resized) std.atomic.spinLoopHint();
+    try value.configureOutput(16, 9, false);
+    const stopped = value.decodedFrames();
+    sleepMs(20);
+    try testing.expectEqual(stopped, value.decodedFrames());
+    try testing.expect(stopped - resized < 100);
 }
 
 test "video paused output reconfiguration rescales the shown frame without decoding" {
