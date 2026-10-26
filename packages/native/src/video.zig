@@ -155,8 +155,10 @@ const ProduceOutcome = struct {
     elapsed_us: u32 = 0,
 };
 
+const OtvLimits = extern struct { max_pixels: u64, max_width: u32, max_height: u32 };
 extern fn otv_open(
     path: [*:0]const u8,
+    limits: *const OtvLimits,
     out_decoder: *?*Decoder,
     out_info: *Info,
     error_out: [*]u8,
@@ -310,20 +312,13 @@ pub const Video = struct {
         var decoder: ?*Decoder = null;
         var info = Info{};
         var detail: [256]u8 = [_]u8{0} ** 256;
-        if (otv_open(path_z.ptr, &decoder, &info, &detail, detail.len) != 0 or decoder == null) {
+        const limits: image.Limits = .{};
+        const shim_limits: OtvLimits = .{ .max_pixels = limits.max_pixels, .max_width = limits.max_width, .max_height = limits.max_height };
+        if (otv_open(path_z.ptr, &shim_limits, &decoder, &info, &detail, detail.len) != 0 or decoder == null) {
             writeOpenError(error_out, std.mem.sliceTo(&detail, 0));
             return error.OpenFailed;
         }
         errdefer otv_close(&decoder);
-        // Frames become native images, so sources beyond the image limits cannot play.
-        const limits: image.Limits = .{};
-        if (info.width == 0 or info.height == 0 or info.width > limits.max_width or info.height > limits.max_height or
-            @as(u64, info.width) * info.height > limits.max_pixels)
-        {
-            const message = std.fmt.bufPrint(&detail, "video size {d}x{d} exceeds the image limits", .{ info.width, info.height }) catch "video size exceeds the image limits";
-            writeOpenError(error_out, message);
-            return error.OpenFailed;
-        }
         const video = try allocator.create(Video);
         errdefer allocator.destroy(video);
         video.* = .{

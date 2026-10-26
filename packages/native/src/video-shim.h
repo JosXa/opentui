@@ -17,6 +17,13 @@ typedef struct {
     uint32_t audio_channels;
 } otv_info;
 
+// Frames above these limits fail to decode, as sources above them fail to open.
+typedef struct {
+    uint64_t max_pixels;
+    uint32_t max_width;
+    uint32_t max_height;
+} otv_limits;
+
 enum {
     OTV_OK = 0,
     OTV_EOF = 1,
@@ -24,7 +31,7 @@ enum {
     OTV_ERROR = -1,
 };
 
-int otv_open(const char *path, otv_decoder **out_decoder, otv_info *out_info,
+int otv_open(const char *path, const otv_limits *limits, otv_decoder **out_decoder, otv_info *out_info,
                   char *error_out, uint32_t error_cap);
 void otv_close(otv_decoder **decoder);
 int otv_seek(otv_decoder *decoder, int64_t target_us);

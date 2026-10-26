@@ -5,9 +5,10 @@
 // Targets without a prebuilt FFmpeg (see build.zig) report video as unavailable.
 #include <stdio.h>
 
-int otv_open(const char *path, otv_decoder **out_decoder, otv_info *out_info,
+int otv_open(const char *path, const otv_limits *limits, otv_decoder **out_decoder, otv_info *out_info,
                   char *error_out, uint32_t error_cap) {
     (void)path;
+    (void)limits;
     (void)out_info;
     if (out_decoder) *out_decoder = NULL;
     if (error_out && error_cap > 0) snprintf(error_out, error_cap, "video decoding is unavailable on this target");
@@ -145,6 +146,7 @@ struct otv_decoder {
     int audio_source_rate;
     AVChannelLayout audio_source_layout;
     char error[256];
+    otv_limits limits;
     // Video frames received from the codec; read across threads for diagnostics.
     uint64_t decoded_frames;
     // Set by the owner to stop an in-flight otv_decode_frame.
@@ -168,6 +170,19 @@ static int fail_video(otv_decoder *decoder, int error, const char *operation) {
 
 static int fail_audio(otv_decoder *decoder, int error, const char *operation) {
     return fail_to(decoder->audio.error, sizeof(decoder->audio.error), error, operation);
+}
+
+// FFmpeg also enforces max_pixels while it allocates a frame, so a frame above the limits may
+// never arrive; the codec's current size names it then.
+static int exceeds_limits(const otv_decoder *decoder, int width, int height) {
+    return width > 0 && height > 0 &&
+           ((uint32_t)width > decoder->limits.max_width || (uint32_t)height > decoder->limits.max_height ||
+            (uint64_t)width * (uint64_t)height > decoder->limits.max_pixels);
+}
+
+static int fail_frame_size(otv_decoder *decoder, int width, int height) {
+    snprintf(decoder->video.error, sizeof(decoder->video.error), "video frame %dx%d exceeds the image limits", width, height);
+    return OTV_ERROR;
 }
 
 static void close_stream(ot_stream_decoder *stream) {
@@ -261,7 +276,20 @@ static int open_stream(otv_decoder *decoder, const char *path, enum AVMediaType 
     // uncapped auto detection spawns one per logical core.
     int cpu_count = av_cpu_count();
     out->codec->thread_count = type == AVMEDIA_TYPE_VIDEO ? (cpu_count > 8 ? 8 : cpu_count) : 1;
-    if (type == AVMEDIA_TYPE_VIDEO) otv_attach_hw_device(decoder, out);
+    if (type == AVMEDIA_TYPE_VIDEO) {
+        // Frames become native images, so sources beyond the image limits cannot play.
+        const int width = out->codec->width, height = out->codec->height;
+        if (width <= 0 || height <= 0) {
+            snprintf(decoder->error, sizeof(decoder->error), "video size %dx%d is invalid", width, height);
+            return OTV_ERROR;
+        }
+        if (exceeds_limits(decoder, width, height)) {
+            snprintf(decoder->error, sizeof(decoder->error), "video size %dx%d exceeds the image limits", width, height);
+            return OTV_ERROR;
+        }
+        out->codec->max_pixels = (int64_t)decoder->limits.max_pixels;
+        otv_attach_hw_device(decoder, out);
+    }
     result = avcodec_open2(out->codec, codec, NULL);
     if (result < 0) return fail(decoder, result, "avcodec_open2");
     out->packet = av_packet_alloc();
@@ -351,9 +379,9 @@ static void copy_open_error(const otv_decoder *decoder, char *error_out, uint32_
     snprintf(error_out, error_cap, "%s", decoder ? decoder->error : "video decoder allocation failed");
 }
 
-int otv_open(const char *path, otv_decoder **out_decoder, otv_info *out_info,
+int otv_open(const char *path, const otv_limits *limits, otv_decoder **out_decoder, otv_info *out_info,
                   char *error_out, uint32_t error_cap) {
-    if (!path || !out_decoder || !out_info) return OTV_ERROR;
+    if (!path || !limits || !out_decoder || !out_info) return OTV_ERROR;
     *out_decoder = NULL;
     if (error_out && error_cap > 0) error_out[0] = '\0';
     av_log_set_level(AV_LOG_ERROR);
@@ -363,6 +391,7 @@ int otv_open(const char *path, otv_decoder **out_decoder, otv_info *out_info,
         copy_open_error(NULL, error_out, error_cap);
         return OTV_ERROR;
     }
+    decoder->limits = *limits;
     decoder->video.stream_index = -1;
     decoder->audio.stream_index = -1;
     decoder->frame_pts_us = AV_NOPTS_VALUE;
@@ -625,9 +654,16 @@ int otv_decode_frame(otv_decoder *decoder, int64_t target_us, const uint8_t **ou
                 reached_eof = 1;
                 break;
             }
-            if (result != OTV_OK) return result;
+            if (result != OTV_OK) {
+                const AVCodecContext *codec = decoder->video.codec;
+                if (result == OTV_ERROR && exceeds_limits(decoder, codec->width, codec->height))
+                    return fail_frame_size(decoder, codec->width, codec->height);
+                return result;
+            }
             __atomic_add_fetch(&decoder->decoded_frames, 1, __ATOMIC_RELAXED);
             candidate = decoder->video.frame;
+            if (exceeds_limits(decoder, candidate->width, candidate->height))
+                return fail_frame_size(decoder, candidate->width, candidate->height);
             int64_t received_pts = stream_pts_us(decoder, &decoder->video, candidate);
             decoder->decode_pts_us = received_pts != AV_NOPTS_VALUE ? received_pts
                                      : decoder->decode_pts_us == AV_NOPTS_VALUE ? 0

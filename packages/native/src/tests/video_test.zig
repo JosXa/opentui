@@ -391,6 +391,7 @@ test "video scene loop restarts playback at the end" {
 const gop_asset = "../core/src/tests/fixtures/video/gop-160x90-24fps-12s.mp4";
 const single_frame_asset = "../core/src/tests/fixtures/video/single-frame-10us.mp4";
 const oversized_asset = "../core/src/tests/fixtures/video/oversized-6000x5000.mp4";
+const switch_asset = "../core/src/tests/fixtures/video/resolution-switch-160x90-to-6000x5000.mp4";
 
 fn sleepMs(ms: i64) void {
     std.Io.sleep(testing.io, .fromMilliseconds(ms), .awake) catch {};
@@ -457,6 +458,16 @@ test "video rejects sources beyond the image limits" {
     var detail: [256]u8 = undefined;
     try testing.expectError(error.OpenFailed, video.Video.open(testing.allocator, oversized_asset, false, &detail));
     try testing.expect(std.mem.indexOf(u8, std.mem.sliceTo(&detail, 0), "limit") != null);
+    // A stream whose first frames fit can switch to a size beyond the limits.
+    const value = try video.Video.open(testing.allocator, switch_asset, true, &detail);
+    defer value.deinit();
+    try value.configureOutput(32, 18, false);
+    try testing.expect(try value.update(0));
+    try testing.expectError(error.DecodeFailed, value.update(1_200_000));
+    try testing.expect(std.mem.indexOf(u8, value.lastError(), "6000x5000 exceeds the image limits") != null);
+    // Decoding jumps to the large keyframe at 1 s; FFmpeg refuses to allocate it, so no frame
+    // beyond the first decodes.
+    try testing.expectEqual(@as(u64, 1), value.decodedFrames());
 }
 
 test "video rejects sync offsets that would overflow the media clock" {
