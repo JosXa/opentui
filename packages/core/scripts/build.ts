@@ -183,7 +183,7 @@ const transpileEntryPoint = (entryPoint: string, outputPath: string): void => {
 // Zig stores archive inputs of a static library as nested members, which other linkers cannot read.
 function checkStaticArchive(path: string): void {
   if (!existsSync(path)) return
-  const members = execFileSync("zig", ["ar", "t", path], { encoding: "utf8" }).split(/\r?\n/)
+  const members = execFileSync("zig", ["ar", "t", path], { cwd: nativeRoot, encoding: "utf8" }).split(/\r?\n/)
   const nested = members.filter((member) => /\.(a|lib)$/.test(member))
   if (nested.length > 0) throw new Error(`${path} contains nested archives: ${nested.join(", ")}`)
 }
