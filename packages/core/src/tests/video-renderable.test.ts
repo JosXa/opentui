@@ -293,6 +293,37 @@ describe("VideoRenderable", () => {
     expect(video.playing).toBe(false)
   })
 
+  test("a looping video wraps at the end without ending", async () => {
+    let ended = 0
+    const video = new VideoRenderable(renderer, {
+      source: SILENT,
+      width: 20,
+      height: 6,
+      loop: true,
+      onEnd: () => ended++,
+    })
+    renderer.root.add(video)
+    video.seek(video.duration - 0.05)
+    video.play()
+    await renderUntil(() => video.currentTime < 1)
+    expect(ended).toBe(0)
+    expect(video.playing).toBe(true)
+  })
+
+  test("maxFps caps how many frames native presents", async () => {
+    const video = new VideoRenderable(renderer, { source: SILENT, width: 20, height: 6, maxFps: 1 })
+    renderer.root.add(video)
+    const native = renderer.nativeScene.videoNode(video)
+    const frames = new Set<bigint>()
+    video.play()
+    await renderUntil(() => {
+      frames.add(native.lib.videoGetState(native.context, native.node).framePtsUs)
+      return video.currentTime >= 1.2
+    })
+    // 1 fps over 1.2 s shows at most 2 or 3 source frames; 24 fps would show about 29.
+    expect(frames.size).toBeLessThanOrEqual(3)
+  })
+
   test("onPlay reports autoplay and playback requested before the source", async () => {
     let plays = 0
     new VideoRenderable(renderer, { source: SILENT, autoplay: true, onPlay: () => plays++ })
