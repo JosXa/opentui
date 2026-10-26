@@ -232,6 +232,67 @@ describe("VideoRenderable", () => {
     expect(video.live).toBe(true)
   })
 
+  test("playback options set before a source apply when it opens", () => {
+    const errors: Error[] = []
+    const video = new VideoRenderable(renderer, { onError: (error) => errors.push(error) })
+    const lib = renderer.nativeScene.videoNode(video).lib
+    const setters = [
+      ["loop", true, "videoSetLoop", true],
+      ["muted", true, "videoSetMuted", true],
+      ["volume", 0.5, "videoSetVolume", 0.5],
+      ["avSyncOffsetMs", 250, "videoSetAvSyncOffset", 250_000n],
+      ["maxFps", 12, "videoSetMaxFps", 12],
+    ] as const
+    const spies = setters.map(([, , method]) => spyOn(lib, method))
+    try {
+      for (const [option, value] of setters) (video as any)[option] = value
+      for (const spy of spies) expect(spy).not.toHaveBeenCalled()
+      video.source = SILENT
+      setters.forEach(([option, value, , applied], index) => {
+        expect((video as any)[option]).toBe(value)
+        expect(spies[index]).toHaveBeenCalledTimes(1)
+        expect(spies[index].mock.calls[0][2]).toBe(applied)
+      })
+    } finally {
+      for (const spy of spies) spy.mockRestore()
+    }
+    expect(errors).toEqual([])
+  })
+
+  test("rejected volume and sync offsets keep the previous value", () => {
+    const errors: Error[] = []
+    const video = new VideoRenderable(renderer, { source: SILENT, onError: (error) => errors.push(error) })
+    for (const [option, rejected, accepted] of [
+      ["avSyncOffsetMs", 60_001, 60_000],
+      ["avSyncOffsetMs", -60_001, -60_000],
+      ["volume", Number.MAX_VALUE, 3],
+    ] as const) {
+      expect(() => ((video as any)[option] = rejected)).toThrow(RangeError)
+      expect(() => new VideoRenderable(renderer, { [option]: rejected })).toThrow(RangeError)
+      ;(video as any)[option] = accepted
+      expect((video as any)[option]).toBe(accepted)
+    }
+    video.source = undefined
+    video.source = SILENT
+    expect(errors).toEqual([])
+    expect(video.ready).toBe(true)
+  })
+
+  test("pausing before a deferred autoplay report drops its onPlay", async () => {
+    const events: string[] = []
+    const video = new VideoRenderable(renderer, {
+      source: SILENT,
+      autoplay: true,
+      onPlay: () => events.push("play"),
+      onPause: () => events.push("pause"),
+      onReady: () => events.push("ready"),
+    })
+    video.pause()
+    await Promise.resolve()
+    expect(events).toEqual(["pause", "ready"])
+    expect(video.playing).toBe(false)
+  })
+
   test("onPlay reports autoplay and playback requested before the source", async () => {
     let plays = 0
     new VideoRenderable(renderer, { source: SILENT, autoplay: true, onPlay: () => plays++ })

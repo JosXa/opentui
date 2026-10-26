@@ -34,8 +34,15 @@ export interface VideoRenderableOptions extends RenderableOptions<VideoRenderabl
   onTimeUpdate?: (time: number) => void
 }
 
+// Native code takes the volume as a 32-bit float and the offset within ±60 s.
 function validateVolume(value: number): void {
-  if (!Number.isFinite(value) || value < 0) throw new RangeError("volume must be finite and non-negative")
+  if (!Number.isFinite(value) || value < 0 || value > 3.4028234663852886e38)
+    throw new RangeError("volume must be a finite, non-negative 32-bit float")
+}
+
+function validateAvSyncOffset(value: number): void {
+  if (!Number.isFinite(value) || Math.abs(value) > 60_000)
+    throw new RangeError("avSyncOffsetMs must be from -60000 to 60000")
 }
 
 function validateMaxFps(value: number): void {
@@ -79,6 +86,8 @@ export class VideoRenderable extends Renderable {
   private _playRequested = false
   // Playback keeps the renderer live and the update hook active.
   private _updating = false
+  // Counts reported pauses, so a deferred onPlay that a pause overtook is dropped.
+  private _pauses = 0
   public onReady?: (metadata: VideoMetadata) => void
   public onError?: (error: Error) => void
   public onEnd?: () => void
@@ -96,7 +105,7 @@ export class VideoRenderable extends Renderable {
       this._volume = options.volume ?? 1
       validateVolume(this._volume)
       this._avSyncOffsetMs = options.avSyncOffsetMs ?? 0
-      toMicroseconds(this._avSyncOffsetMs / 1000, "avSyncOffsetMs")
+      validateAvSyncOffset(this._avSyncOffsetMs)
       this._maxFps = options.maxFps ?? 30
       validateMaxFps(this._maxFps)
       this._autoplay = options.autoplay ?? false
@@ -155,9 +164,11 @@ export class VideoRenderable extends Renderable {
       if (play) native.lib.videoCall(native.context, native.node, "ot_video_play")
       const metadata = { ...this._metadata }
       // Frameworks assign handlers after the source; report the open once they are set.
+      const pauses = this._pauses
       this.afterOpen(value, () => {
         this.onReady?.(metadata)
-        if (play) this.onPlay?.()
+        // A pause before this report already told handlers; a stale onPlay would contradict it.
+        if (play && pauses === this._pauses) this.onPlay?.()
       })
     } catch (error) {
       this._playRequested = false
@@ -188,8 +199,7 @@ export class VideoRenderable extends Renderable {
   public set loop(value: boolean | null | undefined) {
     const next = value ?? false
     if (this._loop === next || this.isDestroyed) return
-    this._loop = next
-    this.control((native) => native.lib.videoSetLoop(native.context, native.node, next))
+    if (this.applyOption((native) => native.lib.videoSetLoop(native.context, native.node, next))) this._loop = next
   }
 
   public get muted(): boolean {
@@ -199,8 +209,7 @@ export class VideoRenderable extends Renderable {
   public set muted(value: boolean | null | undefined) {
     const next = value ?? false
     if (this._muted === next || this.isDestroyed) return
-    this._muted = next
-    this.control((native) => native.lib.videoSetMuted(native.context, native.node, next))
+    if (this.applyOption((native) => native.lib.videoSetMuted(native.context, native.node, next))) this._muted = next
   }
 
   public get volume(): number {
@@ -211,8 +220,7 @@ export class VideoRenderable extends Renderable {
     const next = value ?? 1
     validateVolume(next)
     if (this._volume === next || this.isDestroyed) return
-    this._volume = next
-    this.control((native) => native.lib.videoSetVolume(native.context, native.node, next))
+    if (this.applyOption((native) => native.lib.videoSetVolume(native.context, native.node, next))) this._volume = next
   }
 
   public get avSyncOffsetMs(): number {
@@ -221,10 +229,11 @@ export class VideoRenderable extends Renderable {
 
   public set avSyncOffsetMs(value: number | null | undefined) {
     const next = value ?? 0
-    const offset = toMicroseconds(next / 1000, "avSyncOffsetMs")
+    validateAvSyncOffset(next)
     if (this._avSyncOffsetMs === next || this.isDestroyed) return
-    this._avSyncOffsetMs = next
-    this.control((native) => native.lib.videoSetAvSyncOffset(native.context, native.node, offset))
+    const offset = toMicroseconds(next / 1000, "avSyncOffsetMs")
+    if (this.applyOption((native) => native.lib.videoSetAvSyncOffset(native.context, native.node, offset)))
+      this._avSyncOffsetMs = next
   }
 
   public get maxFps(): number {
@@ -235,8 +244,7 @@ export class VideoRenderable extends Renderable {
     const next = value ?? 30
     validateMaxFps(next)
     if (this._maxFps === next || this.isDestroyed) return
-    this._maxFps = next
-    this.control((native) => native.lib.videoSetMaxFps(native.context, native.node, next))
+    if (this.applyOption((native) => native.lib.videoSetMaxFps(native.context, native.node, next))) this._maxFps = next
   }
 
   /** Applies to the next source that opens, and to an open source that has not started yet. */
@@ -256,7 +264,8 @@ export class VideoRenderable extends Renderable {
       native.lib.videoCall(native.context, native.node, "ot_video_play")
     })
     // Handlers may follow autoplay as well.
-    if (started) this.afterOpen(this._source, () => this.onPlay?.())
+    const pauses = this._pauses
+    if (started) this.afterOpen(this._source, () => pauses === this._pauses && this.onPlay?.())
   }
 
   public get ready(): boolean {
@@ -339,6 +348,7 @@ export class VideoRenderable extends Renderable {
       native.lib.videoCall(native.context, native.node, "ot_video_pause")
     })
     if (!paused) return
+    this._pauses++
     const time = this.currentTime
     this.onPause?.()
     this.onTimeUpdate?.(time)
@@ -429,6 +439,12 @@ export class VideoRenderable extends Renderable {
     } catch {
       return fallback
     }
+  }
+
+  // Without a player the option waits for the next open, which applies every stored option.
+  // Returns false when the call failed, so the option keeps its applied value.
+  private applyOption(call: (native: ReturnType<VideoRenderable["native"]>) => void): boolean {
+    return !this._metadata || this.control(call)
   }
 
   // Returns false when the call failed, which is reported, or returned false.

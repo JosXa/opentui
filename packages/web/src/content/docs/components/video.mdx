@@ -72,26 +72,28 @@ await render(() => <video source="./clip.mp4" autoplay loop style={{ width: 60, 
 
 ## Options and state
 
-| Member              | Type                               | Description                                                           |
-| ------------------- | ---------------------------------- | --------------------------------------------------------------------- |
-| `source`            | `string \| undefined`              | MP4 file path                                                         |
-| `fit`               | `"fit" \| "cover" \| "fill"`       | Destination sizing. Defaults to `"fit"`                               |
-| `autoplay`          | `boolean`                          | Plays each source once it opens                                       |
-| `loop`              | `boolean`                          | Restarts at the end                                                   |
-| `muted`             | `boolean`                          | Silences audio. The audio clock keeps running                         |
-| `volume`            | `number`                           | Finite and non-negative. Defaults to `1`                              |
-| `avSyncOffsetMs`    | `number`                           | Positive values show frames earlier relative to the audio             |
-| `maxFps`            | `number`                           | Integer presentation-rate cap from 1 to 120. Defaults to 30           |
-| `ready`             | `boolean`                          | Whether a source is open                                              |
-| `videoMetadata`     | `VideoMetadata \| null`            | `width`, `height`, `fps`, `duration`, and `hasAudio`. Zero is unknown |
-| `playing`, `paused` | `boolean`                          | Playback state. Before a source opens, the requested state            |
-| `ended`             | `boolean`                          | Whether playback reached the end without looping                      |
-| `currentTime`       | `number`                           | Media time in seconds. Assigning it seeks                             |
-| `duration`          | `number`                           | Duration in seconds                                                   |
-| `qualityTier`       | `number`                           | Adaptive decode-size step for Kitty output                            |
-| `play()`, `pause()` | `() => void`                       | Start or stop playback. `toggle()` switches                           |
-| `seek(time)`        | `(seconds: number) => void`        | Seek. `seekBy(delta)` and `seekToMs(ms)` are relative and millisecond |
-| Callbacks           | `onReady`, `onError`, `onEnd`, ... | `onPlay`, `onPause`, `onSeek`, and `onTimeUpdate` report changes      |
+| Member              | Type                               | Description                                                                     |
+| ------------------- | ---------------------------------- | ------------------------------------------------------------------------------- |
+| `source`            | `string \| undefined`              | MP4 file path                                                                   |
+| `fit`               | `"fit" \| "cover" \| "fill"`       | Destination sizing. Defaults to `"fit"`                                         |
+| `autoplay`          | `boolean`                          | Plays each source once it opens                                                 |
+| `loop`              | `boolean`                          | Restarts at the end                                                             |
+| `muted`             | `boolean`                          | Silences audio. The audio clock keeps running                                   |
+| `volume`            | `number`                           | Non-negative and within the 32-bit float range. Defaults to `1`                 |
+| `avSyncOffsetMs`    | `number`                           | From -60000 to 60000. Positive values show frames earlier relative to the audio |
+| `maxFps`            | `number`                           | Integer presentation-rate cap from 1 to 120. Defaults to 30                     |
+| `ready`             | `boolean`                          | Whether a source is open                                                        |
+| `videoMetadata`     | `VideoMetadata \| null`            | `width`, `height`, `fps`, `duration`, and `hasAudio`. Zero is unknown           |
+| `playing`, `paused` | `boolean`                          | Playback state. Before a source opens, the requested state                      |
+| `ended`             | `boolean`                          | Whether playback reached the end without looping                                |
+| `currentTime`       | `number`                           | Media time in seconds. Assigning it seeks                                       |
+| `duration`          | `number`                           | Duration in seconds                                                             |
+| `qualityTier`       | `number`                           | Adaptive decode-size step for Kitty output                                      |
+| `play()`, `pause()` | `() => void`                       | Start or stop playback. `toggle()` switches                                     |
+| `seek(time)`        | `(seconds: number) => void`        | Seek. `seekBy(delta)` and `seekToMs(ms)` are relative and millisecond           |
+| Callbacks           | `onReady`, `onError`, `onEnd`, ... | `onPlay`, `onPause`, `onSeek`, and `onTimeUpdate` report changes                |
+
+Options set before a source opens apply when it opens. An option value out of range throws a `RangeError` and keeps the previous value.
 
 Open, seek, and decode failures call `onError` with the native detail. A failed decode stops playback at its position and keeps the last frame; `play()` and `seek()` retry, and `play()` after a failed open opens the source again. An audio failure keeps playback running silently on the wall clock.
 
