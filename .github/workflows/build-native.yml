@@ -143,6 +143,9 @@ jobs:
           cp packages/native/src/vendor/libwebp/PATENTS artifacts/native-notices/PATENTS-LIBWEBP
           cp packages/native/src/vendor/libwebp/AUTHORS artifacts/native-notices/AUTHORS-LIBWEBP
           cp packages/native/src/vendor/lcms2/LICENSE artifacts/native-notices/LICENSE-LCMS2
+          cp packages/native/src/vendor/ffmpeg/COPYING.LGPLv2.1 artifacts/native-notices/LICENSE-FFMPEG
+          cp packages/native/src/vendor/ffmpeg/README.md artifacts/native-notices/FFMPEG-SOURCE.md
+          cp packages/native/src/vendor/ffmpeg/LICENSE-ZLIB artifacts/native-notices/LICENSE-ZLIB
 
       # Create separate zips for each platform's native binaries
       - name: Package native binaries - darwin-x64
