@@ -1777,7 +1777,8 @@ pub const Scene = struct {
 
     fn record(self: *Scene, entry: Work, reasons: *u32) void {
         const node = entry.node.scene_node.?;
-        if (node.kind == api.OT_SCENE_IMAGE) reasons.* |= renderer.FrameWork.full_path_images;
+        // A video's cells change with its media clock, which no record input holds.
+        if (imageState(node) != null) reasons.* |= renderer.FrameWork.full_path_images;
         const cells = cellLayout(entry.layout);
         const x: i32 = @intFromFloat(cells.screenX);
         const y: i32 = @intFromFloat(cells.screenY);

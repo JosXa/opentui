@@ -6,6 +6,7 @@ const video = @import("../video.zig");
 const image = @import("../image.zig");
 const context = @import("../context.zig");
 const scene = @import("../scene.zig");
+const renderer = @import("../renderer.zig");
 const Fixture = @import("scene_fixture_test.zig").Fixture;
 
 const asset = "../core/src/tests/fixtures/video/testsrc-160x90-24fps-2s.mp4";
@@ -307,6 +308,33 @@ test "video scene nodes paint the current frame through the image path" {
     // The painted buffer retains the frame, so the decoder skips it until release.
     try testing.expect(frame.ref_count > 1);
     try testing.expectEqual(@as(usize, 1), f.cli.getNextBuffer().image_placements.items.len);
+}
+
+// A playing video changes its cells without any scene input changing, so retained paint must
+// never keep its rows. Its first decoded frame can arrive after paints that placed no image.
+test "video scene repaints every committed frame while playing" {
+    const f = try Fixture.init(testing.allocator, 8, 4, .{});
+    defer f.deinit();
+    try f.owner.sceneSetDebugFlags(f.id, c.OT_SCENE_DEBUG_VERIFY);
+    const node = try videoNode(f);
+    _ = try f.owner.videoOpen(node, asset);
+    const value = try playerOf(f, node);
+    value.video.failAudio("test");
+    try f.owner.videoControl(node, video.Player.play, .{});
+    var shown: [2]u32 = .{ 0, 0 };
+    for (0..400) |_| {
+        const done = try f.step(null, frame_options, c.OT_SCENE_FRAME_DONE, null);
+        try testing.expect(f.state.frame_work.full_path_reasons & renderer.FrameWork.full_path_images != 0);
+        _ = try f.owner.sceneFrameCommit(f.id, done, false);
+        var bytes: [4096]u8 = undefined;
+        while (try f.owner.readOutput(f.id, &bytes)) |ticket| try f.owner.completeOutput(f.id, ticket, .written);
+        if (value.video.current_image) |frame| {
+            if (shown[0] == 0) shown[0] = frame.render_id else if (frame.render_id != shown[0]) shown[1] = frame.render_id;
+        }
+        if (shown[1] != 0) break;
+        sleepMs(5);
+    }
+    try testing.expect(shown[1] != 0);
 }
 
 test "video scene playback advances frames natively and ends without looping" {

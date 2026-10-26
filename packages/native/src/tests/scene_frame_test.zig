@@ -560,7 +560,7 @@ fn placedAt(f: Fixture, parent: context.Handle, kind: u32, num: u32, left: f32, 
 // later sibling, and below them a scroll node (rows 4-7) of six rows. Each row changes one input and expects the rows it damages and the full-path
 // reasons. The table runs without VERIFY, then with it: VERIFY must pass and change no count.
 test "Scene frame retained paint damages the rows of changed inputs only" {
-    var results: [2][std.meta.fields(Retained).len + 6]FrameWork = undefined;
+    var results: [2][std.meta.fields(Retained).len + 8]FrameWork = undefined;
     for ([_]bool{ false, true }, &results) |verify, *counts| try retainedTable(verify, counts);
     try testing.expectEqualSlices(FrameWork, &results[0], &results[1]);
 }
@@ -669,7 +669,7 @@ fn retainedTable(verify: bool, counts: []FrameWork) !void {
         .{ .change = .image, .damage = 9, .reasons = FrameWork.full_path_images },
     };
     var image_node: context.Handle = undefined;
-    comptime std.debug.assert(rows.len + 3 <= std.meta.fields(Retained).len + 6);
+    comptime std.debug.assert(rows.len + 6 <= std.meta.fields(Retained).len + 8);
     for (rows, 0..) |row, row_index| {
         errdefer std.debug.print("row {s}, verify {}\n", .{ @tagName(row.change), verify });
         switch (row.change) {
@@ -798,7 +798,17 @@ fn retainedTable(verify: bool, counts: []FrameWork) !void {
     try testing.expectEqual(FrameWork.full_path_images | FrameWork.full_path_unretained, counts[rows.len].full_path_reasons);
     try testing.expectEqual(FrameWork.full_path_unretained, counts[rows.len + 1].full_path_reasons);
     try testing.expectEqual(@as(u32, 2), counts[rows.len + 2].damage_rows);
-    for (counts[rows.len + 3 ..]) |*unused| unused.* = .{};
+    // A video takes the full path like an image, although only its rows changed, and frames
+    // retain again two frames after it goes.
+    const video_node = try placedAt(f, f.root, c.OT_SCENE_VIDEO, 12, 6, 7, 2, 1);
+    _ = try f.owner.videoOpen(video_node, "../core/src/tests/fixtures/video/testsrc-160x90-24fps-2s.mp4");
+    counts[rows.len + 3] = try presentWork(f, .{});
+    try testing.expectEqual(FrameWork.full_path_images, counts[rows.len + 3].full_path_reasons);
+    try testing.expectEqual(@as(u32, 9), counts[rows.len + 3].damage_rows);
+    try f.owner.sceneDestroyNode(video_node);
+    counts[rows.len + 4] = try presentWork(f, .{});
+    counts[rows.len + 5] = try presentWork(f, .{});
+    for (counts[rows.len + 6 ..]) |*unused| unused.* = .{};
     // A presented frame that differs from what paint produces fails a verified frame.
     if (!verify) return;
     try f.cli.currentRenderBuffer.drawText("X", 9, 3, ansi.rgbColor(255, 255, 255, 255), null, 0);
