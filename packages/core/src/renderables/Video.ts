@@ -1,5 +1,5 @@
 import type { OptimizedBuffer } from "../buffer.js"
-import { Renderable, type RenderableOptions } from "../Renderable.js"
+import { Renderable, type NativeRenderableIntegration, type RenderableOptions } from "../Renderable.js"
 import type { RenderContext } from "../types.js"
 import type { NativeVideoState } from "../zig.js"
 import type { ImageFit } from "./Image.js"
@@ -54,7 +54,7 @@ function toMicroseconds(seconds: number, label: string): bigint {
  * this wrapper sends control calls and reads playback state once per frame while playing.
  */
 export class VideoRenderable extends Renderable {
-  static override readonly nativeIntegration = this.defineNativeIntegration({
+  static override readonly nativeIntegration: NativeRenderableIntegration = {
     kind: "video",
     body: { native: this.prototype.renderSelf, buffered: true },
     lifecycle: {
@@ -64,8 +64,7 @@ export class VideoRenderable extends Renderable {
       },
     },
     bufferComposition: "native",
-    construction: "prototype",
-  })
+  }
 
   private _source: string | undefined
   private _fit: ImageFit
