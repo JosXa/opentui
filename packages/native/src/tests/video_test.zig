@@ -586,6 +586,32 @@ test "video decoding jumps to a keyframe ahead instead of decoding the gap" {
     try testing.expect(value.state.frame_pts_us <= 7_000_000 and value.state.frame_pts_us > 7_000_000 - frame_us);
 }
 
+// The worker and the audio thread allocate through the Context allocator, whose test build
+// checks for leaks. Destroying a node stops a long decode; destroying the Context stops a
+// playing video's audio thread.
+test "video scene teardown during a decode and during audio leaks nothing" {
+    const f = try Fixture.init(testing.allocator, 8, 4, .{});
+    defer f.deinit();
+    const decoding = try videoNode(f);
+    _ = try f.owner.videoOpen(decoding, gop_asset);
+    const gop = (try playerOf(f, decoding)).video;
+    try gop.configureOutput(32, 18, false);
+    try testing.expect(try gop.update(0));
+    const before = gop.decodedFrames();
+    try testing.expect(try gop.prepare(5_900_000));
+    while (gop.decodedFrames() == before) std.atomic.spinLoopHint();
+    try f.owner.sceneDestroyNode(decoding);
+
+    const node = try f.owner.sceneCreateNode(f.id, c.OT_SCENE_VIDEO, 3);
+    try f.owner.sceneMoveNode(node, f.root, 0);
+    _ = try f.owner.videoOpen(node, asset);
+    const value = try playerOf(f, node);
+    value.video.setAudioOffline(true);
+    try f.owner.videoControl(node, video.Player.play, .{});
+    try paint(f);
+    try prebuffer(value.video);
+}
+
 test "video seek and teardown cancel a long decode" {
     const value = try openGop();
     defer value.deinit();
