@@ -1777,12 +1777,13 @@ pub const Scene = struct {
 
     fn record(self: *Scene, entry: Work, reasons: *u32) void {
         const node = entry.node.scene_node.?;
-        // A video's cells change with its media clock, which no record input holds.
-        if (imageState(node) != null) reasons.* |= renderer.FrameWork.full_path_images;
         const cells = cellLayout(entry.layout);
         const x: i32 = @intFromFloat(cells.screenX);
         const y: i32 = @intFromFloat(cells.screenY);
         var painted = intersection(.{ .x = x, .y = y, .width = @intFromFloat(cells.width), .height = @intFromFloat(cells.height) }, entry.clip);
+        if (node.kind == api.OT_SCENE_IMAGE) reasons.* |= renderer.FrameWork.full_path_images;
+        // A painted video's cells change with its media clock, which no record input holds.
+        if (node.kind == api.OT_SCENE_VIDEO and painted.width != 0 and painted.height != 0) reasons.* |= renderer.FrameWork.full_path_images;
         // A surface draws at its own size, which can pass the node's rows.
         if (entry.node.surface) |source| {
             if (source.image_placements.items.len != 0) reasons.* |= renderer.FrameWork.full_path_images;

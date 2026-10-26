@@ -809,6 +809,14 @@ fn retainedTable(verify: bool, counts: []FrameWork) !void {
     counts[rows.len + 4] = try presentWork(f, .{});
     counts[rows.len + 5] = try presentWork(f, .{});
     for (counts[rows.len + 6 ..]) |*unused| unused.* = .{};
+    // A video that paints no cell, here one off screen, takes the damaged-rows path, and the
+    // frames after it damage only the surface's rows again.
+    const off_screen = try placedAt(f, f.root, c.OT_SCENE_VIDEO, 13, 20, 7, 2, 1);
+    _ = try f.owner.videoOpen(off_screen, "../core/src/tests/fixtures/video/testsrc-160x90-24fps-2s.mp4");
+    try testing.expectEqual(@as(u32, 0), (try presentWork(f, .{})).full_path_reasons);
+    const kept = try presentWork(f, .{});
+    try testing.expectEqual(@as(u32, 0), kept.full_path_reasons);
+    try testing.expectEqual(@as(u32, 2), kept.damage_rows);
     // A presented frame that differs from what paint produces fails a verified frame.
     if (!verify) return;
     try f.cli.currentRenderBuffer.drawText("X", 9, 3, ansi.rgbColor(255, 255, 255, 255), null, 0);
