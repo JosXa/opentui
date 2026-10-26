@@ -143,6 +143,10 @@ struct otv_decoder {
     uint32_t audio_pending_frames;
     uint32_t audio_pending_offset;
     int audio_swr_drained;
+    // Set once the first audio frame at or after seek_us was placed.
+    int audio_started;
+    // Silent frames that play before the pending audio.
+    uint64_t audio_silence_frames;
     enum AVSampleFormat audio_source_format;
     int audio_source_rate;
     AVChannelLayout audio_source_layout;
@@ -522,6 +526,8 @@ int otv_seek(otv_decoder *decoder, int64_t target_us) {
     decoder->audio_pending_frames = 0;
     decoder->audio_pending_offset = 0;
     decoder->audio_swr_drained = 0;
+    decoder->audio_started = 0;
+    decoder->audio_silence_frames = 0;
     av_frame_unref(decoder->video_lookahead);
     av_frame_unref(decoder->video_selected);
     swr_free(&decoder->swr);
@@ -718,6 +724,14 @@ int otv_read_audio(otv_decoder *decoder, float *out_samples, uint32_t capacity_f
     *out_frames = 0;
     if (!decoder->has_audio || capacity_frames == 0) return OTV_OK;
     while (*out_frames < capacity_frames) {
+        if (decoder->audio_silence_frames > 0) {
+            uint32_t count = capacity_frames - *out_frames;
+            if (decoder->audio_silence_frames < count) count = (uint32_t)decoder->audio_silence_frames;
+            memset(out_samples + (size_t)*out_frames * 2, 0, (size_t)count * 2 * sizeof(float));
+            decoder->audio_silence_frames -= count;
+            *out_frames += count;
+            continue;
+        }
         if (decoder->audio_pending_offset < decoder->audio_pending_frames) {
             uint32_t available = decoder->audio_pending_frames - decoder->audio_pending_offset;
             uint32_t count = available < capacity_frames - *out_frames ? available : capacity_frames - *out_frames;
@@ -756,6 +770,11 @@ int otv_read_audio(otv_decoder *decoder, float *out_samples, uint32_t capacity_f
             av_channel_layout_compare(&decoder->audio_source_layout, &decoder->audio.frame->ch_layout) != 0) {
             if (configure_swr(decoder, decoder->audio.frame) != OTV_OK) return OTV_ERROR;
         }
+        // The clock counts played samples from seek_us, so a track that starts later plays
+        // silence until its first sample.
+        if (!decoder->audio_started && pts != AV_NOPTS_VALUE && pts > decoder->seek_us)
+            decoder->audio_silence_frames = (uint64_t)av_rescale_rnd(pts - decoder->seek_us, 48000, AV_TIME_BASE, AV_ROUND_NEAR_INF);
+        decoder->audio_started = 1;
         int capacity = swr_get_out_samples(decoder->swr, decoder->audio.frame->nb_samples);
         if (capacity < 0) return fail_audio(decoder, capacity, "swr_get_out_samples");
         if (ensure_audio_capacity(decoder, (size_t)capacity) != OTV_OK) return OTV_ERROR;

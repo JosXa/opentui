@@ -391,6 +391,7 @@ test "video scene loop restarts playback at the end" {
 const gop_asset = "../core/src/tests/fixtures/video/gop-160x90-24fps-12s.mp4";
 const single_frame_asset = "../core/src/tests/fixtures/video/single-frame-10us.mp4";
 const oversized_asset = "../core/src/tests/fixtures/video/oversized-6000x5000.mp4";
+const late_audio_asset = "../core/src/tests/fixtures/video/late-audio-160x90-0.5s.mp4";
 const switch_asset = "../core/src/tests/fixtures/video/resolution-switch-160x90-to-6000x5000.mp4";
 
 fn sleepMs(ms: i64) void {
@@ -846,6 +847,26 @@ test "video audio after a first seek starts at the target sample" {
         for (0..frames) |frame| {
             try testing.expectApproxEqAbs(reference[(start + frame) * 2], sought[frame * 2], 0.001);
         }
+    }
+    // A track that starts after the video plays silence until its first sample, so the sine
+    // that starts at 0.5 s stays at 0.5 s from the start and after a later seek.
+    var detail: [256]u8 = undefined;
+    const late = try video.Video.open(testing.allocator, late_audio_asset, true, &detail);
+    defer late.deinit();
+    for ([_]i64{ 0, 250_000 }) |target_us| {
+        if (target_us > 0) try late.seek(target_us);
+        var frames: usize = 0;
+        while (true) {
+            const decoded = try late.readAudio(sought[frames * 2 ..], @intCast(@min(4096, sought.len / 2 - frames)));
+            if (decoded == 0) break;
+            frames += decoded;
+        }
+        const first = for (sought[0 .. frames * 2], 0..) |sample, index| {
+            if (@abs(sample) > 0.05) break index / 2;
+        } else frames;
+        const expected: usize = @intCast(@divExact((500_000 - target_us) * 48, 1000));
+        errdefer std.debug.print("seek {d}: first loud sample {d}, expected about {d}\n", .{ target_us, first, expected });
+        try testing.expect(first >= expected and first < expected + 100);
     }
 }
 
